@@ -409,3 +409,95 @@ class SnowflakeCommonMixin(SnowflakeStructuredReportMixin):
             self.structured_reporter.warning(key, reason)
         else:
             self.structured_reporter.failure(key, reason)
+
+
+def mask_query_literal_values(query_text: str) -> str:
+    """
+    Mask literal values in SQL query text by replacing:
+    - String literals (single-quoted) with '?'
+    - Numeric literals with '?'
+
+    This helps protect sensitive data in INSERT, UPDATE, and DELETE queries.
+
+    Args:
+        query_text: The SQL query text to mask
+
+    Returns:
+        Query text with literal values masked
+    """
+    import re
+
+    masked_query = query_text
+
+    # First, mask string literals (single-quoted strings)
+    # Pattern handles:
+    # - Standard strings: 'text'
+    # - Escaped quotes (SQL standard): 'It''s' (two single quotes)
+    # - Escaped backslashes: 'It\'s' (backslash escape)
+    # - Empty strings: ''
+    # Using non-greedy match to handle multiple strings in one query
+    string_pattern = r"'([^'\\]|\\.|'')*'"
+    masked_query = re.sub(string_pattern, "'?'", masked_query)
+
+    # Then, mask numeric literals
+    # Pattern handles:
+    # - Integers: 123, -456
+    # - Decimals: 123.45, -67.89
+    # - Scientific notation: 1e10, -2.5e-3, 1.5E+10
+    # Using word boundaries to avoid matching numbers in identifiers
+    numeric_pattern = r"\b(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b"
+
+    def replace_numeric(match):
+        """Replace numeric literal only if it's not part of an identifier."""
+        num_str = match.group(1)
+        # Check if preceded by identifier characters (letter, underscore, dot)
+        # or followed by identifier characters - if so, might be part of identifier
+        start_pos = match.start()
+        end_pos = match.end()
+
+        # Check character before the number
+        if start_pos > 0:
+            char_before = masked_query[start_pos - 1]
+            # If preceded by identifier char, might be part of identifier (e.g., table1, col_2)
+            if char_before.isalnum() or char_before in ("_", "."):
+                return num_str  # Don't replace
+
+        # Check character after the number
+        if end_pos < len(masked_query):
+            char_after = masked_query[end_pos]
+            # If followed by identifier char, might be part of identifier
+            if char_after.isalnum() or char_after in ("_", "."):
+                return num_str  # Don't replace
+
+        return "?"
+
+    masked_query = re.sub(numeric_pattern, replace_numeric, masked_query)
+
+    return masked_query
+
+
+def should_mask_query(query_text: str) -> bool:
+    """
+    Determine if a query should have its literals masked.
+    Currently masks INSERT, UPDATE, and DELETE queries.
+
+    Args:
+        query_text: The SQL query text to check
+
+    Returns:
+        True if the query should be masked, False otherwise
+    """
+    import re
+
+    # Normalize query text - remove leading whitespace and comments
+    normalized = query_text.strip()
+    # Remove single-line comments
+    normalized = re.sub(r"--.*$", "", normalized, flags=re.MULTILINE)
+    # Remove multi-line comments
+    normalized = re.sub(r"/\*.*?\*/", "", normalized, flags=re.DOTALL)
+    normalized = normalized.strip()
+
+    # Check if query starts with INSERT, UPDATE, or DELETE (case-insensitive)
+    # Use word boundary to avoid matching these as substrings
+    pattern = r"^\s*(INSERT|UPDATE|DELETE)\s+"
+    return bool(re.match(pattern, normalized, re.IGNORECASE))

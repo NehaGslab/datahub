@@ -46,6 +46,7 @@ from datahub.ingestion.source.snowflake.snowflake_utils import (
     SnowflakeFilter,
     SnowflakeIdentifierBuilder,
     SnowflakeStructuredReportMixin,
+    mask_query_literal_values,
 )
 from datahub.ingestion.source.snowflake.stored_proc_lineage import (
     StoredProcCall,
@@ -504,6 +505,11 @@ class SnowflakeQueriesExtractor(SnowflakeStructuredReportMixin, Closeable):
             or re.search(r"\bTEMPORARY\b", query_text, re.IGNORECASE) is not None
         )
 
+    @staticmethod
+    def _mask_literal_values(query_text: str) -> str:
+        """Delegate to shared utility function."""
+        return mask_query_literal_values(query_text)
+
     def _parse_audit_log_row(
         self, row: Dict[str, Any], users: UsersMapping
     ) -> Optional[
@@ -531,6 +537,14 @@ class SnowflakeQueriesExtractor(SnowflakeStructuredReportMixin, Closeable):
         query_type: QueryType = SNOWFLAKE_QUERY_TYPE_MAPPING.get(
             snowflake_query_type, QueryType.UNKNOWN
         )
+        if query_type in (
+            QueryType.INSERT,
+            QueryType.UPDATE,
+            QueryType.DELETE,
+            QueryType.MERGE,
+            QueryType.SELECT,
+        ):
+            query_text = self._mask_literal_values(query_text)
 
         direct_objects_accessed = res["direct_objects_accessed"]
         objects_modified = res["objects_modified"]
@@ -1169,6 +1183,7 @@ ORDER BY QUERY_START_TIME ASC
 
 
 SNOWFLAKE_QUERY_TYPE_MAPPING = {
+    "SELECT": QueryType.SELECT,
     "INSERT": QueryType.INSERT,
     "UPDATE": QueryType.UPDATE,
     "DELETE": QueryType.DELETE,

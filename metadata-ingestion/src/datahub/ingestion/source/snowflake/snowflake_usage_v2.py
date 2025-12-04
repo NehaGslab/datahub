@@ -25,6 +25,8 @@ from datahub.ingestion.source.snowflake.snowflake_utils import (
     SnowflakeCommonMixin,
     SnowflakeFilter,
     SnowflakeIdentifierBuilder,
+    mask_query_literal_values,
+    should_mask_query,
 )
 from datahub.ingestion.source.state.redundant_run_skip_handler import (
     RedundantUsageRunSkipHandler,
@@ -40,7 +42,6 @@ from datahub.metadata.com.linkedin.pegasus2avro.dataset import (
 )
 from datahub.metadata.com.linkedin.pegasus2avro.timeseries import TimeWindowSize
 from datahub.metadata.schema_classes import OperationClass, OperationTypeClass
-from datahub.sql_parsing.sqlglot_utils import try_format_query
 from datahub.utilities.perf_timer import PerfTimer
 from datahub.utilities.sql_formatter import trim_query
 
@@ -313,10 +314,17 @@ class SnowflakeUsageExtractor(SnowflakeCommonMixin, Closeable):
                 [
                     (
                         trim_query(
-                            try_format_query(query, self.platform), budget_per_query
+                            mask_query_literal_values(query)
+                            if should_mask_query(query)
+                            else query,
                         )
                         if self.config.format_sql_queries
-                        else trim_query(query, budget_per_query)
+                        else trim_query(
+                            mask_query_literal_values(query)
+                            if should_mask_query(query)
+                            else query,
+                            budget_per_query,
+                        )
                     )
                     for query in top_sql_queries
                 ]
