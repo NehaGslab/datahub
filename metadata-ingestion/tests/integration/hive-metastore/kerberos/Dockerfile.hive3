@@ -1,0 +1,28 @@
+# Hive 3.x with Kerberos support for QOP testing
+# This image adds Kerberos client tools and custom entrypoint for proper Kerberos setup
+
+FROM apache/hive:3.1.3
+
+USER root
+
+# Install Kerberos client tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        krb5-user \
+        libpam-krb5 \
+        netcat-openbsd \
+        postgresql-client && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create directory for keytabs
+RUN mkdir -p /keytabs && chmod 755 /keytabs
+
+# Copy custom entrypoint
+COPY entrypoint-hive3.sh /entrypoint-hive3.sh
+RUN chmod +x /entrypoint-hive3.sh
+
+# Run as root for kinit (keytab needs proper access)
+# In production, you'd use a proper keytab with restricted permissions
+ENTRYPOINT ["/entrypoint-hive3.sh"]
+

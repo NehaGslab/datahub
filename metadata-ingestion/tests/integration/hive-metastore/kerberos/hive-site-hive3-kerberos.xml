@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Hive 3.x configuration with Kerberos authentication and STRICT QOP enforcement.
+  This configuration is designed to reproduce the QOP mismatch error that occurs
+  when the client uses a different QOP than the server expects.
+  
+  Key difference from Hive 2.x: Hive 3.x strictly enforces the QOP setting.
+-->
+<configuration>
+    <!-- ==================== Metastore Database Connection ==================== -->
+    <property>
+        <name>javax.jdo.option.ConnectionURL</name>
+        <value>jdbc:postgresql://hive3-metastore-postgresql:5432/metastore</value>
+    </property>
+    <property>
+        <name>javax.jdo.option.ConnectionDriverName</name>
+        <value>org.postgresql.Driver</value>
+    </property>
+    <property>
+        <name>javax.jdo.option.ConnectionUserName</name>
+        <value>hive</value>
+    </property>
+    <property>
+        <name>javax.jdo.option.ConnectionPassword</name>
+        <value>hive</value>
+    </property>
+    <property>
+        <name>datanucleus.autoCreateSchema</name>
+        <value>true</value>
+    </property>
+    <property>
+        <name>datanucleus.schema.autoCreateTables</name>
+        <value>true</value>
+    </property>
+
+    <!-- ==================== Metastore URIs ==================== -->
+    <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://hive3-metastore:9083</value>
+    </property>
+    <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>/user/hive/warehouse</value>
+    </property>
+
+    <!-- ==================== Kerberos Authentication ==================== -->
+    <property>
+        <name>hive.metastore.sasl.enabled</name>
+        <value>true</value>
+        <description>Enable SASL authentication for Hive Metastore</description>
+    </property>
+    <property>
+        <name>hive.metastore.kerberos.keytab.file</name>
+        <value>/keytabs/hive.keytab</value>
+    </property>
+    <property>
+        <name>hive.metastore.kerberos.principal</name>
+        <value>hive/hive3-metastore.test.local@TEST.LOCAL</value>
+    </property>
+
+    <!-- ==================== STRICT QOP ENFORCEMENT (Key for reproducing error) ==================== -->
+    <!-- 
+        This is the critical setting that causes the "Invalid token" error in Hive 3.x
+        when the client doesn't match this QOP level.
+        
+        Hive 3.x strictly enforces this, unlike Hive 2.x which is lenient.
+        
+        Options:
+        - auth: Authentication only (no encryption)
+        - auth-int: Authentication + integrity checking
+        - auth-conf: Authentication + confidentiality (encryption) - STRICTEST
+    -->
+    <property>
+        <name>hive.metastore.thrift.sasl.qop</name>
+        <value>auth-conf</value>
+        <description>
+            STRICT: Require encrypted Thrift RPC for all HMS connections.
+            Clients MUST use auth-conf or connection will fail with "Invalid token".
+        </description>
+    </property>
+
+    <!-- ==================== HiveServer2 Settings ==================== -->
+    <!-- Disable HS2 Kerberos for simplicity - we only test HMS -->
+    <property>
+        <name>hive.server2.authentication</name>
+        <value>NONE</value>
+    </property>
+
+    <!-- ==================== Schema Verification ==================== -->
+    <property>
+        <name>hive.metastore.schema.verification</name>
+        <value>false</value>
+    </property>
+    <property>
+        <name>hive.metastore.schema.verification.record.version</name>
+        <value>false</value>
+    </property>
+
+    <!-- ==================== Transaction Settings (Hive 3.x) ==================== -->
+    <property>
+        <name>hive.txn.manager</name>
+        <value>org.apache.hadoop.hive.ql.lockmgr.DbTxnManager</value>
+    </property>
+    <property>
+        <name>hive.support.concurrency</name>
+        <value>true</value>
+    </property>
+</configuration>
+
