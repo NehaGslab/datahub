@@ -1,0 +1,12 @@
+source:
+  type: kafka
+  config:
+    connection:
+      bootstrap: "localhost:9092"
+      consumer_config:
+        security.protocol: "PLAINTEXT"
+    topic_patterns:
+      allow:
+        - "demo.*"
+    env: PROD
+

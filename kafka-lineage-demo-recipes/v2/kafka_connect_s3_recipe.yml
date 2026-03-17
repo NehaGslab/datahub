@@ -1,0 +1,16 @@
+source:
+  type: kafka-connect
+  config:
+    connect_uri: "http://localhost:8083"
+    connector_patterns:
+      allow:
+        - "s3-sink-orders"
+    provided_configs:
+      - provider: env
+        path_key: "s3.bucket.name"
+        value: "kafka-lineage-demo-bucket"
+      - provider: env
+        path_key: "s3.region"
+        value: "us-east-1"
+    env: PROD
+

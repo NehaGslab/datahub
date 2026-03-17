@@ -1,0 +1,24 @@
+source:
+  type: snowflake
+  config:
+    account_id: "<AccountId>"
+    warehouse: "<Warehouse>"
+    username: "<Username>"
+    password: "<Password>"
+    role: "DATAHUB_ROLE"
+    include_table_lineage: true
+    ignore_start_time_lineage: false
+    start_time: "2026-03-04T00:00:00Z"
+    database_pattern:
+      allow:
+        - "^DEMO_DB$"
+    schema_pattern:
+      allow:
+        - "^PUBLIC$"
+    table_pattern:
+      allow:
+        - ".*_EVENTS$"
+    profiling:
+      enabled: false
+    env: PROD
+

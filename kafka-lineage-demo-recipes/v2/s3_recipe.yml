@@ -1,0 +1,9 @@
+source:
+  type: s3
+  config:
+    path_specs:
+      - include: "s3://kafka-lineage-demo-bucket/v2/{table}/*/*.parquet"
+    aws_config:
+      aws_region: "us-east-1"
+    env: PROD
+

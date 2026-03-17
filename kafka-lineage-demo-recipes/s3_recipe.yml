@@ -1,0 +1,11 @@
+source:
+  type: s3
+  config:
+    path_specs:
+      - include: "s3://kafka-lineage-demo-bucket/topics/{table}/partition=*/*.parquet"
+    aws_config:
+      aws_region: "us-east-1"
+      # If running locally, uses ~/.aws/credentials automatically
+      # If running inside EKS with IRSA, no explicit keys needed
+    env: PROD
+

@@ -1,0 +1,13 @@
+source:
+  type: kafka-connect
+  config:
+    connect_uri: "http://localhost:9083"
+    connector_patterns:
+      allow:
+        - "source->target.MirrorSourceConnector"
+    generic_connectors:
+      - connector_name: "source->target.MirrorSourceConnector"
+        source_platform: "kafka"
+        source_dataset: "raw_orders"
+    env: PROD
+
