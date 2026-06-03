@@ -9,6 +9,7 @@ from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
     ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
     wait,
 )
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from threading import Event, Lock, Thread, current_thread
 from typing import (
+    TYPE_CHECKING,
     Any,
     Dict,
     Iterable,
@@ -27,6 +29,15 @@ from typing import (
     Tuple,
     Union,
 )
+
+if TYPE_CHECKING:
+    from datahub.ingestion.source.ge_data_profiler import DatahubGEProfiler
+    from datahub.ingestion.source.profiling.common import (
+        ProfilerRequest as GEProfilerRequest,
+    )
+    from datahub.ingestion.source.sqlalchemy_profiler.sqlalchemy_profiler import (
+        SQLAlchemyProfiler,
+    )
 
 # This import verifies that the dependencies are available.
 import teradatasqlalchemy.types as custom_types
@@ -53,6 +64,7 @@ from datahub.emitter.mce_builder import (
     make_dataset_urn_with_platform_instance,
     make_user_urn,
 )
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.emitter.mcp_builder import add_owner_to_entity_wu
 from datahub.ingestion.api.common import PipelineContext
 from datahub.ingestion.api.decorators import (
@@ -1048,6 +1060,9 @@ class TeradataReport(SQLSourceReport, BaseTimeWindowReport):
     # Retry statistics
     num_db_retries: int = 0
 
+    # Profiling timeout statistics
+    num_profiling_timeouts: int = 0
+
     # Per-phase error breakdown for self-service diagnostics; categories align
     # with _categorize_view_error() so support can pinpoint root cause quickly.
     schema_discovery_failures: int = 0
@@ -1392,6 +1407,16 @@ class TeradataConfig(BaseTeradataConfig, BaseTimeWindowConfig):
             "sleep time is included in the measurement, so the threshold should be set "
             "well above the expected base query time. "
             "Set to 0 to disable. Default is 60 seconds."
+        ),
+    )
+    profiling_timeout_seconds: int = Field(
+        default=300,
+        ge=1,
+        description=(
+            "Maximum number of seconds to allow for profiling a single table. "
+            "If profiling a table exceeds this limit, the table is skipped with a warning "
+            "and counted in ``report.num_profiling_timeouts``. "
+            "Default is 300 seconds (5 minutes)."
         ),
     )
 
@@ -1775,6 +1800,91 @@ ORDER by DataBaseName, TableName;
     # Retry helpers — thin wrappers that bind config values so call sites
     # don't repeat max_attempts / initial_backoff_seconds everywhere.
     # ------------------------------------------------------------------
+
+    def loop_profiler(
+        self,
+        profile_requests: List["GEProfilerRequest"],
+        profiler: Union["DatahubGEProfiler", "SQLAlchemyProfiler"],
+        platform: Optional[str] = None,
+    ) -> Iterable[MetadataWorkUnit]:
+        """Override to enforce a per-table profiling timeout.
+
+        Each request is submitted to a thread pool individually so that a single
+        slow table cannot block the rest. Tables that exceed
+        ``profiling_timeout_seconds`` are skipped and counted in
+        ``report.num_profiling_timeouts``.
+        """
+        timeout = self.config.profiling_timeout_seconds
+        profiler_args = self.get_profile_args()
+
+        def _profile_single(
+            req: "GEProfilerRequest",
+        ) -> List[Tuple["GEProfilerRequest", Any]]:
+            return list(
+                profiler.generate_profiles(
+                    [req],
+                    1,
+                    platform=platform,
+                    profiler_args=profiler_args,
+                )
+            )
+
+        executor = ThreadPoolExecutor(max_workers=self.config.profiling.max_workers)
+        try:
+            future_to_request: Dict[Future, "GEProfilerRequest"] = {
+                executor.submit(_profile_single, req): req for req in profile_requests
+            }
+            for future, req in future_to_request.items():
+                try:
+                    pairs = future.result(timeout=timeout)
+                except FutureTimeoutError:
+                    future.cancel()
+                    logger.warning(
+                        "Profiling timed out after %ds for table %s — skipping.",
+                        timeout,
+                        req.pretty_name,
+                    )
+                    self.report.num_profiling_timeouts += 1
+                    self.report.warning(
+                        title="Profiling timeout",
+                        message=f"Profiling exceeded {timeout}s limit and was skipped.",
+                        context=req.pretty_name,
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "Profiling failed for table %s: %s",
+                        req.pretty_name,
+                        exc,
+                    )
+                    continue
+
+                for request, profile in pairs:
+                    if profile is None:
+                        continue
+                    dataset_name = request.pretty_name
+                    if (
+                        dataset_name
+                        in self.profile_metadata_info.dataset_name_to_storage_bytes
+                        and profile.sizeInBytes is None
+                    ):
+                        profile.sizeInBytes = (
+                            self.profile_metadata_info.dataset_name_to_storage_bytes[
+                                dataset_name
+                            ]
+                        )
+                    dataset_urn = make_dataset_urn_with_platform_instance(
+                        self.platform,
+                        dataset_name,
+                        self.config.platform_instance,
+                        self.config.env,
+                    )
+                    yield MetadataChangeProposalWrapper(
+                        entityUrn=dataset_urn,
+                        aspect=profile,
+                    ).as_workunit()
+        finally:
+            executor.shutdown(wait=False)
 
     @contextmanager
     def _retry_connect(

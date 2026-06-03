@@ -5122,3 +5122,144 @@ class TestCharPaddingFixes:
             library_col_info={"name": "col1", "nullable": True, "autoincrement": False},
         )
         assert cols[0]["autoincrement"] is False
+
+
+class TestProfilingTimeout:
+    """Per-table profiling timeout: a single slow table must not block all others."""
+
+    # ------------------------------------------------------------------
+    # Config defaults
+    # ------------------------------------------------------------------
+
+    def test_default_profiling_timeout_seconds(self):
+        config = TeradataConfig.model_validate(_base_config())
+        assert config.profiling_timeout_seconds == 300
+
+    def test_custom_profiling_timeout_accepted(self):
+        config = TeradataConfig.model_validate(
+            {**_base_config(), "profiling_timeout_seconds": 600}
+        )
+        assert config.profiling_timeout_seconds == 600
+
+    def test_profiling_timeout_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            TeradataConfig.model_validate(
+                {**_base_config(), "profiling_timeout_seconds": 0}
+            )
+
+    # ------------------------------------------------------------------
+    # loop_profiler timeout enforcement
+    # ------------------------------------------------------------------
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def _make_profile_result(self, name: str) -> MagicMock:
+        """A minimal DatasetProfile-like object."""
+        profile = MagicMock()
+        profile.sizeInBytes = None
+        profile.timestampMillis = 0
+        return profile
+
+    def test_timeout_increments_counter_and_emits_warning(self):
+        """A table whose profiling exceeds the timeout is skipped; the counter
+        and warning report are updated exactly once."""
+        block = Event()
+
+        def _blocking_generate_profiles(requests, max_workers, **kwargs):
+            block.wait(timeout=10)
+            for req in requests:
+                yield req, self._make_profile_result(req.pretty_name)
+
+        source = _create_source_patched({"profiling_timeout_seconds": 1})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _blocking_generate_profiles
+
+        request = self._make_profiler_request("db.huge_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            list(source.loop_profiler([request], mock_profiler))
+
+        block.set()
+
+        assert source.report.num_profiling_timeouts == 1
+        assert any(
+            "huge_table" in ctx
+            for w in source.report.warnings
+            for ctx in (w.context if isinstance(w.context, list) else [w.context or ""])
+        )
+
+    def test_successful_table_yields_work_unit(self):
+        """A table that completes within the timeout produces a MetadataWorkUnit."""
+        profile_obj = self._make_profile_result("db.fast_table")
+
+        def _immediate_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                yield req, profile_obj
+
+        source = _create_source_patched({"profiling_timeout_seconds": 30})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _immediate_generate_profiles
+
+        request = self._make_profiler_request("db.fast_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_timeouts == 0
+        assert len(work_units) == 1
+        assert isinstance(work_units[0], MetadataWorkUnit)
+
+    def test_slow_table_does_not_block_fast_tables(self):
+        """When one table times out, other tables still produce work units."""
+        slow_event = Event()
+        results_order: List[str] = []
+
+        def _mixed_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                if req.pretty_name == "db.slow_table":
+                    slow_event.wait(timeout=10)
+                results_order.append(req.pretty_name)
+                yield req, self._make_profile_result(req.pretty_name)
+
+        source = _create_source_patched({"profiling_timeout_seconds": 1})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _mixed_generate_profiles
+
+        requests = [
+            self._make_profiler_request("db.fast_table_1"),
+            self._make_profiler_request("db.slow_table"),
+            self._make_profiler_request("db.fast_table_2"),
+        ]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        slow_event.set()
+
+        assert source.report.num_profiling_timeouts == 1
+        # The two fast tables must still produce work units despite the timeout.
+        assert len(work_units) == 2
+
+    def test_none_profile_is_skipped_without_timeout_penalty(self):
+        """A None profile (e.g. profiler setup failed) is silently skipped and
+        does not increment num_profiling_timeouts."""
+
+        def _none_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                yield req, None
+
+        source = _create_source_patched({"profiling_timeout_seconds": 30})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _none_generate_profiles
+
+        request = self._make_profiler_request("db.empty_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_timeouts == 0
+        assert len(work_units) == 0
