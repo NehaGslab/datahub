@@ -1,9 +1,8 @@
 import logging
 import re
-import time
 from collections import defaultdict
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from threading import Event, Thread, current_thread
@@ -30,6 +29,7 @@ from datahub.ingestion.source.sql.teradata import (
     TeradataReport,
     TeradataSource,
     TeradataTable,
+    ViewErrorCategory,
     _categorize_view_error,
     _engine_connect_with_retry,
     _execute_with_retry,
@@ -539,7 +539,7 @@ class TestTeradataSource:
                 queries = source._make_lineage_queries()
 
             assert len(queries) > 0
-            query, _ = queries[0]
+            query = queries[0].sql
             assert "TIMESTAMP" in query
             assert "None" not in query
 
@@ -946,7 +946,7 @@ class TestLineageQuerySeparation:
             queries = source._make_lineage_queries()
 
             assert len(queries) == 1
-            query_sql, _ = queries[0]
+            query_sql = queries[0].sql
             assert '"DBC".QryLogV' in query_sql
             assert "PDCRDATA.DBQLSqlTbl_Hst" not in query_sql
             assert "2024-01-01" in query_sql
@@ -982,7 +982,8 @@ class TestLineageQuerySeparation:
             assert len(queries) == 1
 
             # Single UNION query should contain both historical and current data
-            union_query, union_kind = queries[0]
+            union_query = queries[0].sql
+            union_kind = queries[0].label
             assert union_kind == "historical_union"
             assert '"DBC".QryLogV' in union_query
             assert '"PDCRINFO".DBQLSqlTbl_Hst' in union_query
@@ -1021,7 +1022,7 @@ class TestLineageQuerySeparation:
                 queries = source._make_lineage_queries()
 
             assert len(queries) == 1
-            query_sql, _ = queries[0]
+            query_sql = queries[0].sql
             assert '"DBC".QryLogV' in query_sql
             assert '"PDCRDATA".DBQLSqlTbl_Hst' not in query_sql
 
@@ -1056,7 +1057,8 @@ class TestLineageQuerySeparation:
             assert len(queries) == 1
 
             # UNION query should have case-insensitive database filters for both parts
-            union_query, union_kind = queries[0]
+            union_query = queries[0].sql
+            union_kind = queries[0].label
             assert union_kind == "historical_union"
             assert (
                 "l.DefaultDatabase (NOT CASESPECIFIC) in ('test_db1' (NOT CASESPECIFIC),'test_db2' (NOT CASESPECIFIC))"
@@ -1421,7 +1423,8 @@ class TestQueryConstruction:
                 source = TeradataSource(config, PipelineContext(run_id="test"))
 
             queries = source._make_lineage_queries()
-            current_query, current_kind = queries[0]
+            current_query = queries[0].sql
+            current_kind = queries[0].label
             assert current_kind == "current_only"
 
             # Verify current query structure
@@ -1458,7 +1461,8 @@ class TestQueryConstruction:
                 source, "_check_historical_table_exists", return_value=True
             ):
                 queries = source._make_lineage_queries()
-                union_query, union_kind = queries[0]
+                union_query = queries[0].sql
+                union_kind = queries[0].label
                 assert union_kind == "historical_union"
 
                 # Verify UNION query contains historical data structure
@@ -2218,10 +2222,6 @@ class TestNewConfigDefaults:
                 }
             )
 
-    def test_lineage_slow_query_log_seconds_default(self) -> None:
-        config = TeradataConfig.model_validate(_base_config())
-        assert config.lineage_slow_query_log_seconds == 60.0
-
 
 class TestIncrementalColumnExtraction:
     """#1 — skip column extraction for tables unchanged since the watermark."""
@@ -2549,7 +2549,7 @@ class TestLineageQueryScoping:
         with patch.object(source, "_check_historical_table_exists", return_value=False):
             queries = source._make_lineage_queries()
 
-        query, _ = queries[0]
+        query = queries[0].sql
         assert "sales_db" in query
         assert "hr_db" in query
         assert "'All'" not in query
@@ -2567,7 +2567,7 @@ class TestLineageQueryScoping:
         with patch.object(source, "_check_historical_table_exists", return_value=False):
             queries = source._make_lineage_queries()
 
-        query, _ = queries[0]
+        query = queries[0].sql
         assert "explicit_db" in query
         assert "other_db" not in query
 
@@ -2585,7 +2585,7 @@ class TestLineageQueryScoping:
             queries = source._make_lineage_queries()
 
         assert len(queries) == 1
-        assert "DefaultDatabase in" not in queries[0][0]
+        assert "DefaultDatabase in" not in queries[0].sql
 
 
 class TestConfigurableTimeouts:
@@ -4270,10 +4270,10 @@ class TestErrorCategorizationReport:
     def test_view_error_counters_are_exclusive(self) -> None:
         """increment_view_error routes each category to exactly its own counter."""
         categories = {
-            "timeout": "view_timeout_errors",
-            "parse": "view_parse_errors",
-            "permission": "view_permission_errors",
-            "unknown": "view_unknown_errors",
+            ViewErrorCategory.TIMEOUT: "view_timeout_errors",
+            ViewErrorCategory.PARSE: "view_parse_errors",
+            ViewErrorCategory.PERMISSION: "view_permission_errors",
+            ViewErrorCategory.UNKNOWN: "view_unknown_errors",
         }
         for category, field_name in categories.items():
             report = TeradataReport()
@@ -4295,7 +4295,12 @@ class TestErrorCategorizationReport:
             256,
         )  # m_per_thread must be divisible by len(categories)
         # Rotate through all four categories so every counter is exercised.
-        categories = ["timeout", "parse", "permission", "unknown"]
+        categories = [
+            ViewErrorCategory.TIMEOUT,
+            ViewErrorCategory.PARSE,
+            ViewErrorCategory.PERMISSION,
+            ViewErrorCategory.UNKNOWN,
+        ]
 
         def worker(_: int) -> None:
             for i in range(m_per_thread):
@@ -4612,7 +4617,6 @@ class TestViewProcessingErrorCounters:
             "view_unknown_errors",
         ]
         source = _create_source_patched({"max_workers": 2})
-        source._effective_max_workers = 2
         self._run_multi_threaded(source, exc)
 
         assert source.report.num_view_processing_failures == 1
@@ -4623,7 +4627,6 @@ class TestViewProcessingErrorCounters:
 
     def test_multi_threaded_successful_view_does_not_increment_failures(self):
         source = _create_source_patched({"max_workers": 2})
-        source._effective_max_workers = 2
         mock_conn = _make_mock_conn()
         mock_inspector = _make_mock_inspector("testdb")
         mock_engine = MagicMock()
@@ -4653,6 +4656,69 @@ class TestViewProcessingErrorCounters:
         assert source.report.view_parse_errors == 0
         assert source.report.view_permission_errors == 0
         assert source.report.view_unknown_errors == 0
+
+    def test_cancelled_future_does_not_increment_error_counter(self) -> None:
+        """fut.result() raising CancelledError must be caught by the dedicated
+        ``except CancelledError: pass`` branch, not ``except Exception``.
+
+        The stall-timeout path increments the counter *before* calling
+        ``fut.cancel()``.  If the outer loop also incremented on CancelledError
+        the counter would be doubled.  This test injects a pre-cancelled future
+        directly into the done-set processing loop to verify the counter stays
+        at zero when only the CancelledError path fires (i.e., the stall-timeout
+        path did NOT run in this scenario)."""
+        source = _create_source_patched({"max_workers": 2})
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+        mock_engine = MagicMock()
+
+        cancelled_future: Future = Future()
+        assert cancelled_future.cancel(), "precondition: Future must be cancellable"
+
+        mock_executor = MagicMock()
+        mock_executor.submit.return_value = cancelled_future
+
+        call_count = [0]
+
+        def _fake_wait(fs, timeout, return_when):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Return the cancelled future as the sole completed future.
+                return ({cancelled_future}, set())
+            return (set(), set())
+
+        with (
+            patch.object(
+                source, "_get_or_create_pooled_engine", return_value=mock_engine
+            ),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.ThreadPoolExecutor",
+                return_value=mock_executor,
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.wait",
+                side_effect=_fake_wait,
+            ),
+        ):
+            list(
+                source._loop_views_with_connection_pool(
+                    ["view_a"], "testdb", source.config
+                )
+            )
+
+        assert source.report.view_timeout_errors == 0
+        assert source.report.view_parse_errors == 0
+        assert source.report.view_permission_errors == 0
+        assert source.report.view_unknown_errors == 0
+        assert source.report.num_view_processing_failures == 0
 
     @pytest.mark.parametrize(
         "exc, expected_fragment",
@@ -4698,14 +4764,17 @@ def _patch_lineage_fetch(
     rows: list,
     query_sql: str = "SELECT 1",
     query_kind: str = "current_only",
-    sleep_seconds: float = 0.0,
+    fake_db_elapsed: float = 0.0,
 ) -> Iterator[None]:
     """Context manager that patches the minimal set of methods so that
     _fetch_lineage_entries_chunked returns *rows* without hitting a real DB.
 
-    *sleep_seconds* lets tests simulate a slow query by injecting a
-    time.sleep() call inside the patched _execute_with_cursor_fallback.
-    *query_kind* is forwarded as the label in the (sql, kind) tuple returned
+    *fake_db_elapsed* controls the elapsed time reported by the production
+    code's ``time.monotonic()`` measurements.  When non-zero, ``time.monotonic``
+    is patched to return deterministic values (0 on the first call, then
+    *fake_db_elapsed* on all subsequent calls) so slow-query detection is
+    exercised without relying on real wall-clock time.
+    *query_kind* is forwarded as the label in the LineageQuery returned
     by the mocked _make_lineage_queries, matching the real API contract.
     """
     mock_conn = _make_mock_conn()
@@ -4714,11 +4783,9 @@ def _patch_lineage_fetch(
     result_mock.fetchmany.side_effect = [rows, []]
 
     def _fake_execute(conn, sql, **kwargs):
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
         return result_mock
 
-    patches = [
+    patches: List[Any] = [
         patch.object(source, "get_metadata_engine", return_value=MagicMock()),
         patch.object(
             source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
@@ -4732,6 +4799,20 @@ def _patch_lineage_fetch(
             return_value=[LineageQuery(sql=query_sql, label=query_kind)],
         ),
     ]
+
+    if fake_db_elapsed > 0.0:
+        # Return values that make query_db_elapsed == fake_db_elapsed:
+        #   call 0 (t_start before execute)  → 0
+        #   call 1 (t_start after execute)   → fake_db_elapsed (elapsed = fake_db_elapsed)
+        #   calls 2+ (fetchmany timing)      → fake_db_elapsed (0 additional overhead)
+        _mono_seq = iter([0.0, fake_db_elapsed] + [fake_db_elapsed] * 50)
+        patches.append(
+            patch(
+                "datahub.ingestion.source.sql.teradata.time.monotonic",
+                side_effect=lambda: next(_mono_seq, fake_db_elapsed),
+            )
+        )
+
     with ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -4820,7 +4901,7 @@ class TestLineageQueryTimingReport:
         """A fast query does not increment lineage_slow_queries_detected."""
         source = _make_lineage_source({"lineage_slow_query_log_seconds": 60.0})
 
-        with _patch_lineage_fetch(source, rows=[], sleep_seconds=0.0):
+        with _patch_lineage_fetch(source, rows=[], fake_db_elapsed=0.0):
             list(source._fetch_lineage_entries_chunked())
 
         assert source.report.lineage_slow_queries_detected == 0
@@ -4831,7 +4912,7 @@ class TestLineageQueryTimingReport:
 
         sql = "SELECT * FROM DBC.QryLogV WHERE ts > '2024-01-01'"
         with (
-            _patch_lineage_fetch(source, rows=[], query_sql=sql, sleep_seconds=0.05),
+            _patch_lineage_fetch(source, rows=[], query_sql=sql, fake_db_elapsed=0.1),
             caplog.at_level(
                 logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
             ),
@@ -4862,7 +4943,7 @@ class TestLineageQueryTimingReport:
         distinctive = "SELECT distinctive_marker FROM DBC.QryLogV"
         with (
             _patch_lineage_fetch(
-                source, rows=[], query_sql=distinctive, sleep_seconds=0.05
+                source, rows=[], query_sql=distinctive, fake_db_elapsed=0.1
             ),
             caplog.at_level(
                 logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
@@ -4886,7 +4967,7 @@ class TestLineageQueryTimingReport:
         long_sql = "SELECT " + "x" * 600 + " FROM DBC.QryLogV"
         with (
             _patch_lineage_fetch(
-                source, rows=[], query_sql=long_sql, sleep_seconds=0.05
+                source, rows=[], query_sql=long_sql, fake_db_elapsed=0.1
             ),
             caplog.at_level(
                 logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
@@ -4908,7 +4989,7 @@ class TestLineageQueryTimingReport:
         source = _make_lineage_source({"lineage_slow_query_log_seconds": 0.0})
 
         with (
-            _patch_lineage_fetch(source, rows=[], sleep_seconds=0.05),
+            _patch_lineage_fetch(source, rows=[], fake_db_elapsed=0.1),
             caplog.at_level(
                 logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
             ),
@@ -4950,6 +5031,105 @@ class TestLineageQueryTimingReport:
         assert "query_1 (current_only)" in source.report.lineage_query_timings
 
 
+class TestLineageWatchdog:
+    """The lineage-fetch watchdog emits a stall warning at most once per stall,
+    even when its loop body executes multiple times while the query is stuck."""
+
+    def test_watchdog_stall_warning_fires_exactly_once_per_stall(self) -> None:
+        """The stall_warned flag inside _watchdog prevents repeat firings.
+
+        When the watchdog ticks three times while the query is still blocked,
+        report.warning() must be called exactly once — not once per tick.
+        The test controls the watchdog loop by replacing the Event used for
+        watchdog_stop with a fast-cycling stub, so no real wall-clock time is
+        consumed for the check_interval sleep."""
+        source = _make_lineage_source({"lineage_fetch_stall_warning_seconds": 1})
+        mock_conn = _make_mock_conn()
+        result_mock = MagicMock()
+        result_mock.fetchmany.side_effect = [[], []]
+
+        # Two threading.Event instances we control directly (real events,
+        # not patched), used only for synchronisation between the test
+        # threads — not the watchdog_stop event.
+        main_is_blocked = Event()
+        main_can_continue = Event()
+
+        def _blocking_execute(conn, sql, **kwargs):
+            main_is_blocked.set()  # signal: main thread is inside the execute
+            main_can_continue.wait(timeout=15)
+            return result_mock
+
+        class _ThreeTickEvent:
+            """Replaces watchdog_stop inside _fetch_lineage_entries_chunked.
+
+            wait() returns False ("not stopped") three times so the watchdog
+            body runs three times, then returns True ("stopped") and releases
+            the main thread.  The minimum real check_interval is 10 s, so
+            without this stub the test would take 30 s+."""
+
+            def __init__(self) -> None:
+                self._tick = 0
+
+            def wait(self, timeout: Optional[float] = None) -> bool:
+                # Block until main thread is actually inside the execute so
+                # phase_state["last_event_at"] is already set.
+                main_is_blocked.wait(timeout=15)
+                self._tick += 1
+                if self._tick > 3:
+                    main_can_continue.set()  # release the blocked execute
+                    return True  # stop watchdog loop
+                return False  # run watchdog body again
+
+            def set(self) -> None:
+                pass  # called from the finally-block; safe to ignore
+
+        # Use thread-identity routing instead of a position-counted sequence.
+        # The watchdog thread is always named "teradata-lineage-watchdog" (see
+        # Thread(..., name=…) in _fetch_lineage_entries_chunked).  Returning
+        # a high value (100.0) from that thread and 0.0 from all others means
+        # elapsed = 100.0 − 0.0 = 100.0 >> stall_seconds (1) no matter how
+        # many logging or setup calls consume time.time() on the main thread.
+        def _thread_aware_time() -> float:
+            if current_thread().name == "teradata-lineage-watchdog":
+                return 100.0
+            return 0.0
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(
+                source,
+                "_execute_with_cursor_fallback",
+                side_effect=_blocking_execute,
+            ),
+            patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[LineageQuery(sql="SELECT 1", label="current_only")],
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.Event",
+                return_value=_ThreeTickEvent(),
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.time.time",
+                side_effect=_thread_aware_time,
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        stall_warnings = [
+            w
+            for w in source.report.warnings
+            if w.title == "Lineage fetch stall detected"
+        ]
+        assert len(stall_warnings) == 1, (
+            f"Expected exactly 1 stall warning; got {len(stall_warnings)}"
+        )
+
+
 class TestHungViewAbandonPath:
     """The fut.cancel() abandon path keeps num_view_processing_timeouts and
     view_timeout_errors consistent so operators cannot see one counter change
@@ -4959,29 +5139,50 @@ class TestHungViewAbandonPath:
         """When a view worker exceeds view_processing_timeout_seconds the
         connector abandons it: num_view_processing_timeouts,
         view_timeout_errors, and num_view_processing_failures must all be
-        incremented exactly once so the counters tell a consistent story."""
+        incremented exactly once so the counters tell a consistent story.
+
+        Uses event-based synchronization and mocked time/wait so the test
+        never blocks on real wall-clock sleeps and is safe on loaded CI."""
         block = Event()
+        worker_started = Event()
 
         def _blocking_process_view(**kwargs):
-            # Simulates a worker stuck in a long-running DB call.  The safety
-            # timeout prevents the test from hanging if something goes wrong.
+            worker_started.set()
             block.wait(timeout=10)
             return iter([])
 
         source = _create_source_patched(
             {
                 "max_workers": 2,
-                # 1-second heartbeat → wait_step = 1s; the stall check fires
-                # after two loop iterations (~2s), which exceeds the 1-second
-                # per-view timeout.
                 "view_processing_timeout_seconds": 1,
                 "view_processing_heartbeat_seconds": 1,
             }
         )
-        source._effective_max_workers = 2
         mock_conn = _make_mock_conn()
         mock_inspector = _make_mock_inspector("testdb")
         mock_engine = MagicMock()
+
+        # Thread-aware time mock: the control thread sees 0.0 for the first
+        # two calls (submit timestamp + last_heartbeat_at initialisation) and
+        # 100.0 for all subsequent calls (stall-check now), so
+        # now − started = 100.0 >> 1 s timeout.
+        # Worker threads (teradata-view-*) always return 0.0 so their
+        # internal timing arithmetic stays non-negative.
+        _control_calls = 0
+
+        def _fake_time() -> float:
+            nonlocal _control_calls
+            if current_thread().name == "test-hung-view-control":
+                _control_calls += 1
+                return 0.0 if _control_calls <= 2 else 100.0
+            return 0.0
+
+        # Fake wait: block until the worker is provably stalled, then return
+        # an empty done-set immediately.  This avoids both the real 1-second
+        # heartbeat-interval sleep and the need for any wall-clock buffer.
+        def _fake_wait(fs, timeout=None, return_when=None):
+            worker_started.wait(timeout=5.0)
+            return (set(), set())
 
         def _run() -> None:
             with (
@@ -5001,6 +5202,14 @@ class TestHungViewAbandonPath:
                 patch.object(
                     source, "_process_view", side_effect=_blocking_process_view
                 ),
+                patch(
+                    "datahub.ingestion.source.sql.teradata.time.time",
+                    side_effect=_fake_time,
+                ),
+                patch(
+                    "datahub.ingestion.source.sql.teradata.wait",
+                    side_effect=_fake_wait,
+                ),
             ):
                 list(
                     source._loop_views_with_connection_pool(
@@ -5008,14 +5217,12 @@ class TestHungViewAbandonPath:
                     )
                 )
 
-        t = Thread(target=_run, daemon=True)
+        t = Thread(target=_run, daemon=True, name="test-hung-view-control")
         t.start()
-        # Two loop iterations of 1s each elapse before the stall check
-        # triggers; add a buffer so the counters are committed before we read.
-        time.sleep(2.5)
-        # Unblock the worker thread so executor.shutdown(wait=True) can finish.
-        block.set()
         t.join(timeout=5.0)
+        # Release the worker thread so it can exit cleanly (executor.shutdown
+        # is wait=False, so _run finishes without blocking on the worker).
+        block.set()
         assert not t.is_alive(), "view-processing thread did not terminate"
 
         assert source.report.num_view_processing_timeouts == 1
