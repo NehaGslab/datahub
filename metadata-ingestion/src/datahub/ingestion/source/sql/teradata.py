@@ -1429,6 +1429,29 @@ class TeradataConfig(BaseTeradataConfig, BaseTimeWindowConfig):
         ),
     )
 
+    profiling_reserved_connections: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Maximum number of concurrent Teradata sessions reserved for profiling. "
+            "Caps the profiling ThreadPoolExecutor's concurrency, ensuring at most this many "
+            "profiling queries run in parallel. "
+            "The remaining sessions (up to max_pool_size) remain available for view-processing "
+            "threads, preventing profiling from starving view processing. "
+            "Must be less than max_pool_size. Default is 4."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_profiling_reserved_connections(self) -> "TeradataConfig":
+        if self.profiling_reserved_connections >= self.max_pool_size:
+            raise ValueError(
+                f"profiling_reserved_connections ({self.profiling_reserved_connections}) "
+                f"must be less than max_pool_size ({self.max_pool_size}) "
+                "to keep at least one connection free for non-profiling operations."
+            )
+        return self
+
 
 @dataclass
 class LineageQuery:
@@ -1820,15 +1843,32 @@ ORDER by DataBaseName, TableName;
         profiler: Union["DatahubGEProfiler", "SQLAlchemyProfiler"],
         platform: Optional[str] = None,
     ) -> Iterable[MetadataWorkUnit]:
-        """Override to enforce a per-table profiling timeout.
+        """Override to enforce a per-table profiling timeout and connection limit.
 
         Each request is submitted to a thread pool individually so that a single
         slow table cannot block the rest. Tables that exceed
         ``profiling_timeout_seconds`` are skipped and counted in
         ``report.num_profiling_timeouts``.
+
+        Concurrency is capped at ``profiling_reserved_connections`` so that
+        profiling never consumes more than that many Teradata sessions, leaving
+        the remainder of the connection pool free for view-processing threads.
         """
         timeout = self.config.profiling_timeout_seconds
         profiler_args = self.get_profile_args()
+
+        # Cap concurrency to reserved connection budget.
+        profiling_workers = min(
+            self.config.profiling.max_workers,
+            self.config.profiling_reserved_connections,
+        )
+        if profiling_workers < self.config.profiling.max_workers:
+            logger.info(
+                "Profiling concurrency capped at %d by profiling_reserved_connections "
+                "(profiling.max_workers=%d).",
+                profiling_workers,
+                self.config.profiling.max_workers,
+            )
 
         def _profile_single(
             req: "GEProfilerRequest",
@@ -1842,7 +1882,7 @@ ORDER by DataBaseName, TableName;
                 )
             )
 
-        executor = ThreadPoolExecutor(max_workers=self.config.profiling.max_workers)
+        executor = ThreadPoolExecutor(max_workers=profiling_workers)
         try:
             future_to_request: Dict[Future, "GEProfilerRequest"] = {
                 executor.submit(_profile_single, req): req for req in profile_requests

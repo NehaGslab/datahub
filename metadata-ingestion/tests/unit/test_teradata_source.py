@@ -5470,3 +5470,129 @@ class TestProfilingTimeout:
 
         assert source.report.num_profiling_timeouts == 0
         assert len(work_units) == 0
+
+
+class TestProfilingReservedConnections:
+    """profiling_reserved_connections caps profiling concurrency to avoid
+    starving view-processing threads of their DB connections."""
+
+    # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
+
+    def test_custom_value_accepted_when_below_max_pool_size(self):
+        config = TeradataConfig.model_validate(
+            {**_base_config(), "profiling_reserved_connections": 6, "max_pool_size": 13}
+        )
+        assert config.profiling_reserved_connections == 6
+
+    def test_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            TeradataConfig.model_validate(
+                {**_base_config(), "profiling_reserved_connections": 0}
+            )
+
+    def test_rejects_value_equal_to_max_pool_size(self):
+        """Equal to max_pool_size leaves zero connections for view processing."""
+        with pytest.raises(ValidationError, match="max_pool_size"):
+            TeradataConfig.model_validate(
+                {
+                    **_base_config(),
+                    "profiling_reserved_connections": 13,
+                    "max_pool_size": 13,
+                }
+            )
+
+    def test_rejects_value_greater_than_max_pool_size(self):
+        with pytest.raises(ValidationError, match="max_pool_size"):
+            TeradataConfig.model_validate(
+                {
+                    **_base_config(),
+                    "profiling_reserved_connections": 20,
+                    "max_pool_size": 13,
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # loop_profiler concurrency capping
+    # ------------------------------------------------------------------
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def test_loop_profiler_concurrency_capped_at_reserved_connections(self):
+        """loop_profiler must not launch more than profiling_reserved_connections
+        concurrent workers, even when profiling.max_workers is much larger."""
+        observed_workers: List[int] = []
+        active_lock = __import__("threading").Lock()
+        active_count = [0]
+
+        def _tracking_generate_profiles(requests, max_workers, **kwargs):
+            with active_lock:
+                active_count[0] += 1
+                observed_workers.append(active_count[0])
+            try:
+                for req in requests:
+                    profile = MagicMock()
+                    profile.sizeInBytes = None
+                    yield req, profile
+            finally:
+                with active_lock:
+                    active_count[0] -= 1
+
+        source = _create_source_patched(
+            {
+                "profiling_reserved_connections": 2,
+                "max_pool_size": 13,
+            }
+        )
+        # Force profiling.max_workers above the reserved limit so the cap is exercised.
+        source.config.profiling.max_workers = 10
+
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _tracking_generate_profiles
+
+        requests = [self._make_profiler_request(f"db.table_{i}") for i in range(6)]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert len(work_units) == 6
+        assert max(observed_workers) <= 2, (
+            f"Expected at most 2 concurrent profiling workers "
+            f"but saw peak of {max(observed_workers)}"
+        )
+
+    def test_loop_profiler_uses_max_workers_when_below_reserved_connections(self):
+        """When profiling.max_workers < profiling_reserved_connections, the lower
+        value governs; no unnecessary capping log is emitted."""
+        call_count = [0]
+
+        def _counting_generate_profiles(requests, max_workers, **kwargs):
+            call_count[0] += 1
+            for req in requests:
+                profile = MagicMock()
+                profile.sizeInBytes = None
+                yield req, profile
+
+        source = _create_source_patched(
+            {
+                "profiling_reserved_connections": 8,
+                "max_pool_size": 13,
+            }
+        )
+        # profiling.max_workers (3) < profiling_reserved_connections (8): no cap applied.
+        source.config.profiling.max_workers = 3
+
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _counting_generate_profiles
+
+        requests = [self._make_profiler_request(f"db.table_{i}") for i in range(3)]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert len(work_units) == 3
