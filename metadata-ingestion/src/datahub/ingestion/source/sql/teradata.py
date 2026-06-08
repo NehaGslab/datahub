@@ -1072,6 +1072,10 @@ class TeradataReport(SQLSourceReport, BaseTimeWindowReport):
     # Profiling timeout statistics
     num_profiling_timeouts: int = 0
 
+    # Profiling permission-error statistics — tables skipped because the
+    # ingestion user lacks SELECT / STATISTICS privilege on that object.
+    num_profiling_permission_errors: int = 0
+
     # Per-phase error breakdown for self-service diagnostics; categories align
     # with _categorize_view_error() so support can pinpoint root cause quickly.
     schema_discovery_failures: int = 0
@@ -1853,6 +1857,11 @@ ORDER by DataBaseName, TableName;
         Concurrency is capped at ``profiling_reserved_connections`` so that
         profiling never consumes more than that many Teradata sessions, leaving
         the remainder of the connection pool free for view-processing threads.
+
+        Permission errors (Teradata 3523/3524 and equivalent messages) are caught
+        per-table, emitted as a structured warning, and counted in
+        ``report.num_profiling_permission_errors`` so that a missing SELECT
+        privilege on one table never prevents profiling of other tables.
         """
         timeout = self.config.profiling_timeout_seconds
         profiler_args = self.get_profile_args()
@@ -1905,11 +1914,28 @@ ORDER by DataBaseName, TableName;
                     )
                     continue
                 except Exception as exc:
-                    logger.warning(
-                        "Profiling failed for table %s: %s",
-                        req.pretty_name,
-                        exc,
-                    )
+                    if _categorize_view_error(exc) == ViewErrorCategory.PERMISSION:
+                        logger.warning(
+                            "Profiling skipped for table %s — permission denied: %s",
+                            req.pretty_name,
+                            exc,
+                        )
+                        self.report.num_profiling_permission_errors += 1
+                        self.report.warning(
+                            title="Profiling permission denied",
+                            message=(
+                                "The ingestion user lacks the required privilege "
+                                "to profile this table. Grant SELECT (or STATISTICS) "
+                                "access to resolve."
+                            ),
+                            context=req.pretty_name,
+                        )
+                    else:
+                        logger.warning(
+                            "Profiling failed for table %s: %s",
+                            req.pretty_name,
+                            exc,
+                        )
                     continue
 
                 for request, profile in pairs:

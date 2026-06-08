@@ -5596,3 +5596,153 @@ class TestProfilingReservedConnections:
             work_units = list(source.loop_profiler(requests, mock_profiler))
 
         assert len(work_units) == 3
+
+
+class TestProfilingPermissionErrors:
+    """Permission errors during profiling must be caught per-table so that one
+    table's missing privilege does not abort profiling for the rest."""
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def _make_profile_result(self) -> MagicMock:
+        profile = MagicMock()
+        profile.sizeInBytes = None
+        return profile
+
+    # ------------------------------------------------------------------
+    # Teradata error-code variants (3523, 3524)
+    # ------------------------------------------------------------------
+
+    def test_permission_error_3523_increments_counter_and_emits_warning(self):
+        """Error 3523 (table-level access denied) is caught; counter and
+        warning are updated and the loop continues."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError(
+                "[Error 3523] User 'etl_user' does not have SELECT access to db.secret_table.",
+                {},
+                None,
+            )
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("db.secret_table")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 0
+        assert any(
+            "secret_table" in ctx
+            for w in source.report.warnings
+            for ctx in (w.context if isinstance(w.context, list) else [w.context or ""])
+        )
+
+    def test_permission_error_3524_increments_counter_and_emits_warning(self):
+        """Error 3524 (database-level access denied) is handled identically."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError(
+                "[Error 3524] User 'etl_user' does not have SELECT access to database restricted_db.",
+                {},
+                None,
+            )
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("restricted_db.table_a")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 0
+
+    # ------------------------------------------------------------------
+    # Keyword-based detection (no numeric code in message)
+    # ------------------------------------------------------------------
+
+    def test_permission_denied_keyword_is_caught(self):
+        """Messages containing 'permission denied' without a numeric code are
+        still classified as permission errors."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError("permission denied for table db.t", {}, None)
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("db.t")
+        with patch.object(source, "get_profile_args", return_value={}):
+            list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+
+    # ------------------------------------------------------------------
+    # Non-permission errors are not miscounted
+    # ------------------------------------------------------------------
+
+    def test_non_permission_error_does_not_increment_permission_counter(self):
+        """A generic failure (e.g. network error) must not be counted as a
+        permission error — the counter must stay at 0."""
+
+        def _failing_generate_profiles(requests, max_workers, **kwargs):
+            raise RuntimeError("unexpected failure")
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _failing_generate_profiles
+
+        request = self._make_profiler_request("db.flaky_table")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 0
+        assert len(work_units) == 0
+
+    # ------------------------------------------------------------------
+    # Isolation — permission error on one table must not block others
+    # ------------------------------------------------------------------
+
+    def test_permission_error_does_not_block_other_tables(self):
+        """When one table raises a permission error, the remaining tables in
+        the batch still complete and yield work units."""
+
+        def _selective_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                if "secret" in req.pretty_name:
+                    raise OperationalError(
+                        "[Error 3523] no SELECT access to db.secret_table.", {}, None
+                    )
+                yield req, self._make_profile_result()
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _selective_generate_profiles
+
+        requests = [
+            self._make_profiler_request("db.public_table_1"),
+            self._make_profiler_request("db.secret_table"),
+            self._make_profiler_request("db.public_table_2"),
+        ]
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 2
+
+    # ------------------------------------------------------------------
+    # Counter starts at zero
+    # ------------------------------------------------------------------
+
+    def test_counter_starts_at_zero(self):
+        source = _create_source_patched()
+        assert source.report.num_profiling_permission_errors == 0
