@@ -1,9 +1,11 @@
 import logging
 import re
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
-from threading import current_thread
+from threading import Event, Thread, current_thread
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.exc import (
     DatabaseError,
+    NotSupportedError,
     OperationalError,
     TimeoutError as PoolTimeoutError,
 )
@@ -21,10 +24,13 @@ from datahub.ingestion.api.workunit import (
     MetadataWorkUnit,
 )
 from datahub.ingestion.source.sql.teradata import (
+    LineageQuery,
     TeradataConfig,
     TeradataReport,
     TeradataSource,
     TeradataTable,
+    ViewErrorCategory,
+    _categorize_view_error,
     _engine_connect_with_retry,
     _execute_with_retry,
     _fetchmany_with_retry,
@@ -533,7 +539,7 @@ class TestTeradataSource:
                 queries = source._make_lineage_queries()
 
             assert len(queries) > 0
-            query = queries[0]
+            query = queries[0].sql
             assert "TIMESTAMP" in query
             assert "None" not in query
 
@@ -940,10 +946,11 @@ class TestLineageQuerySeparation:
             queries = source._make_lineage_queries()
 
             assert len(queries) == 1
-            assert '"DBC".QryLogV' in queries[0]
-            assert "PDCRDATA.DBQLSqlTbl_Hst" not in queries[0]
-            assert "2024-01-01" in queries[0]
-            assert "2024-01-02" in queries[0]
+            query_sql = queries[0].sql
+            assert '"DBC".QryLogV' in query_sql
+            assert "PDCRDATA.DBQLSqlTbl_Hst" not in query_sql
+            assert "2024-01-01" in query_sql
+            assert "2024-01-02" in query_sql
 
     def test_make_lineage_queries_with_historical_available(self):
         """Test that UNION query is returned when historical lineage is enabled and table exists."""
@@ -975,7 +982,9 @@ class TestLineageQuerySeparation:
             assert len(queries) == 1
 
             # Single UNION query should contain both historical and current data
-            union_query = queries[0]
+            union_query = queries[0].sql
+            union_kind = queries[0].label
+            assert union_kind == "historical_union"
             assert '"DBC".QryLogV' in union_query
             assert '"PDCRINFO".DBQLSqlTbl_Hst' in union_query
             assert "UNION" in union_query
@@ -1013,8 +1022,9 @@ class TestLineageQuerySeparation:
                 queries = source._make_lineage_queries()
 
             assert len(queries) == 1
-            assert '"DBC".QryLogV' in queries[0]
-            assert '"PDCRDATA".DBQLSqlTbl_Hst' not in queries[0]
+            query_sql = queries[0].sql
+            assert '"DBC".QryLogV' in query_sql
+            assert '"PDCRDATA".DBQLSqlTbl_Hst' not in query_sql
 
     def test_make_lineage_queries_with_database_filter(self):
         """Test that database filters are correctly applied to UNION query."""
@@ -1047,7 +1057,9 @@ class TestLineageQuerySeparation:
             assert len(queries) == 1
 
             # UNION query should have case-insensitive database filters for both parts
-            union_query = queries[0]
+            union_query = queries[0].sql
+            union_kind = queries[0].label
+            assert union_kind == "historical_union"
             assert (
                 "l.DefaultDatabase (NOT CASESPECIFIC) in ('test_db1' (NOT CASESPECIFIC),'test_db2' (NOT CASESPECIFIC))"
                 in union_query
@@ -1079,7 +1091,12 @@ class TestLineageQuerySeparation:
 
             # Mock the query generation to return 2 queries
             with patch.object(
-                source, "_make_lineage_queries", return_value=["query1", "query2"]
+                source,
+                "_make_lineage_queries",
+                return_value=[
+                    LineageQuery(sql="query1", label="current_only"),
+                    LineageQuery(sql="query2", label="current_only"),
+                ],
             ):
                 # Mock database execution for both queries
                 mock_result1 = MagicMock()
@@ -1139,7 +1156,11 @@ class TestLineageQuerySeparation:
                 source = TeradataSource(config, PipelineContext(run_id="test"))
 
             # Mock the query generation to return 1 query
-            with patch.object(source, "_make_lineage_queries", return_value=["query1"]):
+            with patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[LineageQuery(sql="query1", label="current_only")],
+            ):
                 mock_result = MagicMock()
                 mock_result.fetchmany.side_effect = [
                     [MagicMock(query_text="SELECT 1")],  # First batch
@@ -1189,7 +1210,11 @@ class TestLineageQuerySeparation:
             ):
                 source = TeradataSource(config, PipelineContext(run_id="test"))
 
-            with patch.object(source, "_make_lineage_queries", return_value=["query1"]):
+            with patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[LineageQuery(sql="query1", label="current_only")],
+            ):
                 # Create mock entries
                 mock_entries = [MagicMock(query_text=f"SELECT {i}") for i in range(7)]
 
@@ -1316,7 +1341,12 @@ class TestLineageQuerySeparation:
                 source = TeradataSource(config, PipelineContext(run_id="test"))
 
             with patch.object(
-                source, "_make_lineage_queries", return_value=["query1", "query2"]
+                source,
+                "_make_lineage_queries",
+                return_value=[
+                    LineageQuery(sql="query1", label="current_only"),
+                    LineageQuery(sql="query2", label="current_only"),
+                ],
             ):
                 mock_result = MagicMock()
 
@@ -1359,9 +1389,13 @@ class TestLineageQuerySeparation:
                     assert any("query 1/2" in str(call) for call in info_calls)
                     assert any("query 2/2" in str(call) for call in info_calls)
 
-                    # Should log completion of both queries
-                    assert any("Completed query 1" in str(call) for call in info_calls)
-                    assert any("Completed query 2" in str(call) for call in info_calls)
+                    # Should log completion of both queries (new format: "Completed lineage query_N")
+                    assert any(
+                        "Completed lineage query_1" in str(call) for call in info_calls
+                    )
+                    assert any(
+                        "Completed lineage query_2" in str(call) for call in info_calls
+                    )
 
 
 class TestQueryConstruction:
@@ -1389,7 +1423,9 @@ class TestQueryConstruction:
                 source = TeradataSource(config, PipelineContext(run_id="test"))
 
             queries = source._make_lineage_queries()
-            current_query = queries[0]
+            current_query = queries[0].sql
+            current_kind = queries[0].label
+            assert current_kind == "current_only"
 
             # Verify current query structure
             assert 'FROM "DBC".QryLogV as l' in current_query
@@ -1425,7 +1461,9 @@ class TestQueryConstruction:
                 source, "_check_historical_table_exists", return_value=True
             ):
                 queries = source._make_lineage_queries()
-                union_query = queries[0]
+                union_query = queries[0].sql
+                union_kind = queries[0].label
+                assert union_kind == "historical_union"
 
                 # Verify UNION query contains historical data structure
                 assert 'FROM "PDCRINFO".DBQLSqlTbl_Hst as h' in union_query
@@ -2511,7 +2549,7 @@ class TestLineageQueryScoping:
         with patch.object(source, "_check_historical_table_exists", return_value=False):
             queries = source._make_lineage_queries()
 
-        query = queries[0]
+        query = queries[0].sql
         assert "sales_db" in query
         assert "hr_db" in query
         assert "'All'" not in query
@@ -2529,7 +2567,7 @@ class TestLineageQueryScoping:
         with patch.object(source, "_check_historical_table_exists", return_value=False):
             queries = source._make_lineage_queries()
 
-        query = queries[0]
+        query = queries[0].sql
         assert "explicit_db" in query
         assert "other_db" not in query
 
@@ -2547,7 +2585,7 @@ class TestLineageQueryScoping:
             queries = source._make_lineage_queries()
 
         assert len(queries) == 1
-        assert "DefaultDatabase in" not in queries[0]
+        assert "DefaultDatabase in" not in queries[0].sql
 
 
 class TestConfigurableTimeouts:
@@ -4110,6 +4148,1092 @@ class TestExecuteWithCursorFallback:
         assert result is expected
 
 
+class TestCategorizeViewError:
+    """Unit tests for _categorize_view_error."""
+
+    @pytest.mark.parametrize(
+        "exc, expected",
+        [
+            # --- timeout ---
+            (PoolTimeoutError("pool exhausted"), "timeout"),
+            (TimeoutError("timed out"), "timeout"),
+            (OperationalError("request timed out", None, None), "timeout"),
+            (DatabaseError("i/o timeout during query", None, None), "timeout"),
+            # timeout wins even when permission keywords also appear
+            (
+                OperationalError(
+                    "request timed out — permission check failed", None, None
+                ),
+                "timeout",
+            ),
+            # --- permission ---
+            (
+                OperationalError("permission denied for table foo", None, None),
+                "permission",
+            ),
+            (DatabaseError("access denied to database bar", None, None), "permission"),
+            (DatabaseError("no access to object", None, None), "permission"),
+            (
+                DatabaseError(
+                    "[Error 3523] user does not have SELECT access", None, None
+                ),
+                "permission",
+            ),
+            (
+                OperationalError("[Error 8017] The UserId is invalid.", None, None),
+                "permission",
+            ),
+            # --- parse ---
+            (DatabaseError("syntax error in SQL statement", None, None), "parse"),
+            (DatabaseError("parse error near token SELECT", None, None), "parse"),
+            (
+                DatabaseError("[Error 3706] Syntax error: expected name.", None, None),
+                "parse",
+            ),
+            (
+                DatabaseError(
+                    "[Error 3707] Syntax error, expected something between 'x' and 'y'.",
+                    None,
+                    None,
+                ),
+                "parse",
+            ),
+            (
+                NotSupportedError(
+                    "Feature not supported by this Teradata driver", None, None
+                ),
+                "parse",
+            ),
+            # --- unknown ---
+            (RuntimeError("something exploded"), "unknown"),
+            (ValueError("bad value"), "unknown"),
+            # Three additional paths exercised by production code:
+            # standalone "timeout" keyword (no "timed out" substring)
+            (DatabaseError("query execution timeout", None, None), "timeout"),
+            # error code 3003 (logon failed)
+            (DatabaseError("[Error 3003] Logon failed.", None, None), "permission"),
+            # "authentication failed" keyword
+            (
+                OperationalError("authentication failed for user foo", None, None),
+                "permission",
+            ),
+        ],
+        ids=[
+            "pool_timeout",
+            "python_timeout",
+            "timeout_message",
+            "io_timeout",
+            "timeout_beats_permission",
+            "permission_denied",
+            "access_denied",
+            "no_access",
+            "error_3523",
+            "error_8017",
+            "syntax_error",
+            "parse_error",
+            "error_3706",
+            "error_3707",
+            "not_supported",
+            "generic_exception",
+            "value_error",
+            "timeout_keyword",
+            "error_3003",
+            "authentication_failed",
+        ],
+    )
+    def test_categorize(self, exc: BaseException, expected: str) -> None:
+        assert _categorize_view_error(exc) == expected
+
+
+class TestErrorCategorizationReport:
+    """Report counters are wired correctly to _categorize_view_error categories."""
+
+    def test_increment_schema_discovery_failures(self) -> None:
+        report = TeradataReport()
+        report.increment_schema_discovery_failures()
+        report.increment_schema_discovery_failures()
+        assert report.schema_discovery_failures == 2
+
+    def test_schema_discovery_failures_is_thread_safe(self) -> None:
+        report = TeradataReport()
+        n_threads, m_per_thread = 8, 500
+
+        def worker(_: int) -> None:
+            for _ in range(m_per_thread):
+                report.increment_schema_discovery_failures()
+
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            list(ex.map(worker, range(n_threads)))
+
+        assert report.schema_discovery_failures == n_threads * m_per_thread
+
+    def test_view_error_counters_are_exclusive(self) -> None:
+        """increment_view_error routes each category to exactly its own counter."""
+        categories = {
+            ViewErrorCategory.TIMEOUT: "view_timeout_errors",
+            ViewErrorCategory.PARSE: "view_parse_errors",
+            ViewErrorCategory.PERMISSION: "view_permission_errors",
+            ViewErrorCategory.UNKNOWN: "view_unknown_errors",
+        }
+        for category, field_name in categories.items():
+            report = TeradataReport()
+            report.increment_view_error(category)
+
+            assert getattr(report, field_name) == 1
+            assert report.num_view_processing_failures == 1
+            for other_field in categories.values():
+                if other_field != field_name:
+                    assert getattr(report, other_field) == 0, (
+                        f"Expected {other_field}==0 when category='{category}'"
+                    )
+
+    def test_view_error_counters_are_thread_safe(self) -> None:
+        """increment_view_error is thread-safe: concurrent calls produce no lost updates."""
+        report = TeradataReport()
+        n_threads, m_per_thread = (
+            8,
+            256,
+        )  # m_per_thread must be divisible by len(categories)
+        # Rotate through all four categories so every counter is exercised.
+        categories = [
+            ViewErrorCategory.TIMEOUT,
+            ViewErrorCategory.PARSE,
+            ViewErrorCategory.PERMISSION,
+            ViewErrorCategory.UNKNOWN,
+        ]
+
+        def worker(_: int) -> None:
+            for i in range(m_per_thread):
+                report.increment_view_error(categories[i % len(categories)])
+
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            list(ex.map(worker, range(n_threads)))
+
+        total = n_threads * m_per_thread
+        assert report.num_view_processing_failures == total
+        # Each category gets exactly 1/4 of the total increments.
+        per_category = total // len(categories)
+        assert report.view_timeout_errors == per_category
+        assert report.view_parse_errors == per_category
+        assert report.view_permission_errors == per_category
+        assert report.view_unknown_errors == per_category
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the end-to-end view / schema-discovery counter tests
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_conn() -> MagicMock:
+    """A minimal SQLAlchemy-compatible connection mock."""
+    conn = MagicMock()
+    conn.execute.return_value = MagicMock()
+    return conn
+
+
+def _mock_retry_connect(conn: MagicMock) -> Any:
+    """Return a no-op context manager that yields *conn*."""
+
+    @contextmanager
+    def _cm(*_args, **_kwargs):
+        yield conn
+
+    return _cm
+
+
+def _make_mock_inspector(schema: str) -> MagicMock:
+    """Inspector mock with the _datahub_database attribute pre-set."""
+    inspector = MagicMock()
+    inspector._datahub_database = schema
+    return inspector
+
+
+class TestSchemaDiscoveryFailureCounter:
+    """schema_discovery_failures is incremented exactly when _get_schema_names_with_retry fails."""
+
+    def test_non_retryable_error_increments_counter(self):
+        """A permanent (non-retryable) error increments schema_discovery_failures once."""
+        source = _create_source_patched()
+        mock_engine = MagicMock()
+        mock_engine.connect.side_effect = Exception("permission denied")
+
+        with (
+            patch("time.sleep"),
+            pytest.raises(Exception, match="permission denied"),
+        ):
+            source._get_schema_names_with_retry(mock_engine)
+
+        assert source.report.schema_discovery_failures == 1
+
+    def test_all_retries_exhausted_increments_counter_once(self):
+        """Even when every attempt fails transiently, the counter only goes up by 1."""
+        source = _create_source_patched({"retry_max_attempts": 3})
+        transient = OperationalError("connect timed out", None, None)
+        mock_engine = MagicMock()
+        mock_engine.connect.side_effect = [transient, transient, transient]
+
+        with (
+            patch("time.sleep"),
+            pytest.raises(type(transient)),
+        ):
+            source._get_schema_names_with_retry(mock_engine)
+
+        assert source.report.schema_discovery_failures == 1
+
+    def test_successful_discovery_does_not_increment_counter(self):
+        """A successful schema discovery call leaves schema_discovery_failures at zero."""
+        source = _create_source_patched()
+        good_conn = MagicMock()
+        good_inspector = MagicMock()
+        good_inspector.get_schema_names.return_value = ["db1"]
+        mock_engine = MagicMock()
+        mock_engine.connect.return_value = good_conn
+
+        with patch(
+            "datahub.ingestion.source.sql.teradata.inspect",
+            return_value=good_inspector,
+        ):
+            result = source._get_schema_names_with_retry(mock_engine)
+
+        assert result == ["db1"]
+        assert source.report.schema_discovery_failures == 0
+
+    def test_transient_then_success_does_not_increment_counter(self):
+        """A retry that eventually succeeds must not increment schema_discovery_failures."""
+        source = _create_source_patched()
+        good_conn = MagicMock()
+        good_inspector = MagicMock()
+        good_inspector.get_schema_names.return_value = ["db1"]
+        transient = OperationalError("connect timed out", None, None)
+        mock_engine = MagicMock()
+        mock_engine.connect.side_effect = [transient, good_conn]
+
+        with (
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=good_inspector,
+            ),
+            patch("time.sleep"),
+        ):
+            result = source._get_schema_names_with_retry(mock_engine)
+
+        assert result == ["db1"]
+        assert source.report.schema_discovery_failures == 0
+
+
+class TestViewProcessingErrorCounters:
+    """num_view_processing_failures and per-category counters are updated correctly.
+
+    Both the single-threaded path (_process_views_single_threaded, max_workers=1)
+    and the multi-threaded path (_loop_views_with_connection_pool, max_workers>1)
+    use _categorize_view_error to route failures to the right sub-counter.
+    """
+
+    # ------------------------------------------------------------------
+    # Single-threaded path (_process_views_single_threaded)
+    # ------------------------------------------------------------------
+
+    def _run_single_threaded(
+        self, source: "TeradataSource", view_exc: BaseException
+    ) -> None:
+        """Drive _process_views_single_threaded with one view that raises *view_exc*."""
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch.object(source, "_process_view", side_effect=view_exc),
+        ):
+            # Consume the generator so the exception handler fires.
+            list(
+                source._process_views_single_threaded(
+                    ["view_a"], "testdb", source.config
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "exc, expected_counter",
+        [
+            (PoolTimeoutError("pool exhausted"), "view_timeout_errors"),
+            (
+                OperationalError("permission denied for table foo", None, None),
+                "view_permission_errors",
+            ),
+            (
+                DatabaseError("syntax error in SQL statement", None, None),
+                "view_parse_errors",
+            ),
+            (RuntimeError("unexpected crash"), "view_unknown_errors"),
+        ],
+        ids=["timeout", "permission", "parse", "unknown"],
+    )
+    def test_single_threaded_error_increments_correct_counter(
+        self, exc: BaseException, expected_counter: str
+    ) -> None:
+        all_counters = [
+            "view_timeout_errors",
+            "view_parse_errors",
+            "view_permission_errors",
+            "view_unknown_errors",
+        ]
+        source = _create_source_patched({"max_workers": 1})
+        self._run_single_threaded(source, exc)
+
+        assert source.report.num_view_processing_failures == 1
+        assert getattr(source.report, expected_counter) == 1
+        for counter in all_counters:
+            if counter != expected_counter:
+                assert getattr(source.report, counter) == 0
+
+    def test_single_threaded_multiple_views_accumulate_counters(self):
+        """Two views failing with different errors produce independent sub-counts."""
+        source = _create_source_patched({"max_workers": 1})
+        errors = [
+            OperationalError("permission denied", None, None),
+            DatabaseError("syntax error near token", None, None),
+        ]
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch.object(source, "_process_view", side_effect=errors),
+        ):
+            list(
+                source._process_views_single_threaded(
+                    ["view_a", "view_b"], "testdb", source.config
+                )
+            )
+
+        assert source.report.num_view_processing_failures == 2
+        assert source.report.view_permission_errors == 1
+        assert source.report.view_parse_errors == 1
+        assert source.report.view_timeout_errors == 0
+        assert source.report.view_unknown_errors == 0
+
+    def test_single_threaded_successful_view_does_not_increment_failures(self):
+        """No counters change when all views are processed without error."""
+        source = _create_source_patched({"max_workers": 1})
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch.object(source, "_process_view", return_value=iter([])),
+        ):
+            list(
+                source._process_views_single_threaded(
+                    ["view_ok"], "testdb", source.config
+                )
+            )
+
+        assert source.report.num_view_processing_failures == 0
+        assert source.report.view_timeout_errors == 0
+        assert source.report.view_parse_errors == 0
+        assert source.report.view_permission_errors == 0
+        assert source.report.view_unknown_errors == 0
+
+    # ------------------------------------------------------------------
+    # Multi-threaded path (_loop_views_with_connection_pool, max_workers > 1)
+    # ------------------------------------------------------------------
+
+    def _run_multi_threaded(
+        self, source: "TeradataSource", view_exc: BaseException
+    ) -> None:
+        """Drive the multi-threaded path with one view that raises *view_exc*."""
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+        mock_engine = MagicMock()
+
+        with (
+            patch.object(
+                source, "_get_or_create_pooled_engine", return_value=mock_engine
+            ),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch.object(source, "_process_view", side_effect=view_exc),
+        ):
+            list(
+                source._loop_views_with_connection_pool(
+                    ["view_a"], "testdb", source.config
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "exc, expected_counter",
+        [
+            (PoolTimeoutError("pool exhausted"), "view_timeout_errors"),
+            (
+                DatabaseError("[Error 3523] user has no SELECT access", None, None),
+                "view_permission_errors",
+            ),
+            (
+                DatabaseError(
+                    "[Error 3706] Syntax error in view definition", None, None
+                ),
+                "view_parse_errors",
+            ),
+            (ValueError("schema mismatch"), "view_unknown_errors"),
+        ],
+        ids=["timeout", "permission", "parse", "unknown"],
+    )
+    def test_multi_threaded_error_increments_correct_counter(
+        self, exc: BaseException, expected_counter: str
+    ) -> None:
+        all_counters = [
+            "view_timeout_errors",
+            "view_parse_errors",
+            "view_permission_errors",
+            "view_unknown_errors",
+        ]
+        source = _create_source_patched({"max_workers": 2})
+        self._run_multi_threaded(source, exc)
+
+        assert source.report.num_view_processing_failures == 1
+        assert getattr(source.report, expected_counter) == 1
+        for counter in all_counters:
+            if counter != expected_counter:
+                assert getattr(source.report, counter) == 0
+
+    def test_multi_threaded_successful_view_does_not_increment_failures(self):
+        source = _create_source_patched({"max_workers": 2})
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+        mock_engine = MagicMock()
+
+        with (
+            patch.object(
+                source, "_get_or_create_pooled_engine", return_value=mock_engine
+            ),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch.object(source, "_process_view", return_value=iter([])),
+        ):
+            list(
+                source._loop_views_with_connection_pool(
+                    ["view_ok"], "testdb", source.config
+                )
+            )
+
+        assert source.report.num_view_processing_failures == 0
+        assert source.report.view_timeout_errors == 0
+        assert source.report.view_parse_errors == 0
+        assert source.report.view_permission_errors == 0
+        assert source.report.view_unknown_errors == 0
+
+    def test_cancelled_future_does_not_increment_error_counter(self) -> None:
+        """fut.result() raising CancelledError must be caught by the dedicated
+        ``except CancelledError: pass`` branch, not ``except Exception``.
+
+        The stall-timeout path increments the counter *before* calling
+        ``fut.cancel()``.  If the outer loop also incremented on CancelledError
+        the counter would be doubled.  This test injects a pre-cancelled future
+        directly into the done-set processing loop to verify the counter stays
+        at zero when only the CancelledError path fires (i.e., the stall-timeout
+        path did NOT run in this scenario)."""
+        source = _create_source_patched({"max_workers": 2})
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+        mock_engine = MagicMock()
+
+        cancelled_future: Future = Future()
+        assert cancelled_future.cancel(), "precondition: Future must be cancellable"
+
+        mock_executor = MagicMock()
+        mock_executor.submit.return_value = cancelled_future
+
+        call_count = [0]
+
+        def _fake_wait(fs, timeout, return_when):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Return the cancelled future as the sole completed future.
+                return ({cancelled_future}, set())
+            return (set(), set())
+
+        with (
+            patch.object(
+                source, "_get_or_create_pooled_engine", return_value=mock_engine
+            ),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(source, "_retry_execute"),
+            patch(
+                "datahub.ingestion.source.sql.teradata.inspect",
+                return_value=mock_inspector,
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.ThreadPoolExecutor",
+                return_value=mock_executor,
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.wait",
+                side_effect=_fake_wait,
+            ),
+        ):
+            list(
+                source._loop_views_with_connection_pool(
+                    ["view_a"], "testdb", source.config
+                )
+            )
+
+        assert source.report.view_timeout_errors == 0
+        assert source.report.view_parse_errors == 0
+        assert source.report.view_permission_errors == 0
+        assert source.report.view_unknown_errors == 0
+        assert source.report.num_view_processing_failures == 0
+
+    @pytest.mark.parametrize(
+        "exc, expected_fragment",
+        [
+            (PoolTimeoutError("pool exhausted"), "timed out"),
+            (OperationalError("permission denied", None, None), "Permission denied"),
+            (DatabaseError("syntax error", None, None), "SQL parse error"),
+            (RuntimeError("exploded"), "Unexpected error"),
+        ],
+        ids=["timeout", "permission", "parse", "unknown"],
+    )
+    def test_warn_view_error_emits_correct_category_message(
+        self, exc, expected_fragment
+    ):
+        source = _create_source_patched({"max_workers": 1})
+        self._run_single_threaded(source, exc)
+        assert len(source.report.warnings) == 1
+        assert expected_fragment in source.report.warnings[0].message
+
+
+# ---------------------------------------------------------------------------
+# Helpers for _fetch_lineage_entries_chunked tests
+# ---------------------------------------------------------------------------
+
+
+def _make_lineage_source(
+    extra_config: Optional[Dict[str, Any]] = None,
+) -> TeradataSource:
+    """Lineage source with time-window config set so _fetch_lineage_entries_chunked works."""
+    cfg = {
+        **_base_config(),
+        "include_usage_statistics": True,
+        "start_time": datetime(2024, 1, 1, tzinfo=timezone.utc),
+        "end_time": datetime(2024, 1, 2, tzinfo=timezone.utc),
+        **(extra_config or {}),
+    }
+    return _create_source_patched(cfg)
+
+
+@contextmanager
+def _patch_lineage_fetch(
+    source: TeradataSource,
+    rows: list,
+    query_sql: str = "SELECT 1",
+    query_kind: str = "current_only",
+    fake_db_elapsed: float = 0.0,
+) -> Iterator[None]:
+    """Context manager that patches the minimal set of methods so that
+    _fetch_lineage_entries_chunked returns *rows* without hitting a real DB.
+
+    *fake_db_elapsed* controls the elapsed time reported by the production
+    code's ``time.monotonic()`` measurements.  When non-zero, ``time.monotonic``
+    is patched to return deterministic values (0 on the first call, then
+    *fake_db_elapsed* on all subsequent calls) so slow-query detection is
+    exercised without relying on real wall-clock time.
+    *query_kind* is forwarded as the label in the LineageQuery returned
+    by the mocked _make_lineage_queries, matching the real API contract.
+    """
+    mock_conn = _make_mock_conn()
+    result_mock = MagicMock()
+    # fetchmany: first call returns rows, second signals end-of-results.
+    result_mock.fetchmany.side_effect = [rows, []]
+
+    def _fake_execute(conn, sql, **kwargs):
+        return result_mock
+
+    patches: List[Any] = [
+        patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+        patch.object(
+            source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+        ),
+        patch.object(
+            source, "_execute_with_cursor_fallback", side_effect=_fake_execute
+        ),
+        patch.object(
+            source,
+            "_make_lineage_queries",
+            return_value=[LineageQuery(sql=query_sql, label=query_kind)],
+        ),
+    ]
+
+    if fake_db_elapsed > 0.0:
+        # Return values that make query_db_elapsed == fake_db_elapsed:
+        #   call 0 (t_start before execute)  → 0
+        #   call 1 (t_start after execute)   → fake_db_elapsed (elapsed = fake_db_elapsed)
+        #   calls 2+ (fetchmany timing)      → fake_db_elapsed (0 additional overhead)
+        _mono_seq = iter([0.0, fake_db_elapsed] + [fake_db_elapsed] * 50)
+        patches.append(
+            patch(
+                "datahub.ingestion.source.sql.teradata.time.monotonic",
+                side_effect=lambda: next(_mono_seq, fake_db_elapsed),
+            )
+        )
+
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
+class TestLineageQueryTimingReport:
+    """lineage_query_timings and lineage_slow_queries_detected are populated
+    correctly by _fetch_lineage_entries_chunked."""
+
+    def test_timing_recorded_for_single_query(self):
+        """After a successful fetch the timing dict has one entry."""
+        source = _make_lineage_source()
+
+        with _patch_lineage_fetch(source, rows=[("r1",), ("r2",)]):
+            results = list(source._fetch_lineage_entries_chunked())
+
+        assert results == [("r1",), ("r2",)]
+        assert len(source.report.lineage_query_timings) == 1
+        label, elapsed = next(iter(source.report.lineage_query_timings.items()))
+        assert label.startswith("query_1 (")
+        assert elapsed >= 0.0
+
+    def test_label_is_current_only_when_no_pdcrinfo(self):
+        """A current-only query gets the 'current_only' label from the query constructor."""
+        source = _make_lineage_source()
+        current_sql = "SELECT * FROM DBC.QryLogV WHERE ts > '2024-01-01'"
+
+        with _patch_lineage_fetch(
+            source, rows=[], query_sql=current_sql, query_kind="current_only"
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        assert "query_1 (current_only)" in source.report.lineage_query_timings
+
+    def test_label_is_historical_union_when_pdcrinfo_present(self):
+        """A historical-union query gets the 'historical_union' label from the query constructor."""
+        source = _make_lineage_source()
+        union_sql = (
+            "SELECT * FROM DBC.QryLogV UNION SELECT * FROM PDCRINFO.DBQLSqlTbl_Hst"
+        )
+
+        with _patch_lineage_fetch(
+            source, rows=[], query_sql=union_sql, query_kind="historical_union"
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        assert "query_1 (historical_union)" in source.report.lineage_query_timings
+
+    def test_multiple_queries_produce_one_timing_entry_each(self):
+        """When _make_lineage_queries returns N queries, N entries appear in the dict."""
+        source = _make_lineage_source()
+        mock_conn = _make_mock_conn()
+        result_mock = MagicMock()
+        result_mock.fetchmany.side_effect = [[], [], []]  # empty result for each query
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(
+                source,
+                "_execute_with_cursor_fallback",
+                return_value=result_mock,
+            ),
+            patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[
+                    LineageQuery(sql="SELECT * FROM DBC.QryLogV", label="current_only"),
+                    LineageQuery(
+                        sql="SELECT * FROM PDCRINFO.DBQLSqlTbl_Hst",
+                        label="historical_union",
+                    ),
+                ],
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        assert len(source.report.lineage_query_timings) == 2
+        assert "query_1 (current_only)" in source.report.lineage_query_timings
+        assert "query_2 (historical_union)" in source.report.lineage_query_timings
+
+    def test_no_slow_query_detected_below_threshold(self):
+        """A fast query does not increment lineage_slow_queries_detected."""
+        source = _make_lineage_source({"lineage_slow_query_log_seconds": 60.0})
+
+        with _patch_lineage_fetch(source, rows=[], fake_db_elapsed=0.0):
+            list(source._fetch_lineage_entries_chunked())
+
+        assert source.report.lineage_slow_queries_detected == 0
+
+    def test_slow_query_increments_counter_and_warns(self, caplog):
+        """A query exceeding the threshold increments the counter and logs a warning."""
+        source = _make_lineage_source({"lineage_slow_query_log_seconds": 0.001})
+
+        sql = "SELECT * FROM DBC.QryLogV WHERE ts > '2024-01-01'"
+        with (
+            _patch_lineage_fetch(source, rows=[], query_sql=sql, fake_db_elapsed=0.1),
+            caplog.at_level(
+                logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        assert source.report.lineage_slow_queries_detected == 1
+
+        # The direct logger.warning() (which carries the SQL snippet) uses the
+        # teradata logger; report.warning() uses a different logger, so we
+        # filter by name to count exactly the SQL-bearing record.
+        slow_warnings = [
+            r
+            for r in caplog.records
+            if "Slow lineage query" in r.message
+            and r.name == "datahub.ingestion.source.sql.teradata"
+        ]
+        assert len(slow_warnings) == 1
+        warning_msg = slow_warnings[0].message
+        assert "query_1 (current_only)" in warning_msg
+        assert "threshold" in warning_msg
+        assert source.report.warnings[0].title == "Slow lineage query detected"
+
+    def test_slow_query_warning_includes_sql_snippet(self, caplog):
+        """The warning message contains a prefix of the SQL text."""
+        source = _make_lineage_source({"lineage_slow_query_log_seconds": 0.001})
+
+        distinctive = "SELECT distinctive_marker FROM DBC.QryLogV"
+        with (
+            _patch_lineage_fetch(
+                source, rows=[], query_sql=distinctive, fake_db_elapsed=0.1
+            ),
+            caplog.at_level(
+                logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        slow_warnings = [
+            r
+            for r in caplog.records
+            if "Slow lineage query" in r.message
+            and r.name == "datahub.ingestion.source.sql.teradata"
+        ]
+        assert len(slow_warnings) == 1
+        assert "distinctive_marker" in slow_warnings[0].message
+
+    def test_slow_query_sql_truncated_to_500_chars(self, caplog):
+        """SQL longer than 500 characters is truncated with an ellipsis in the warning."""
+        source = _make_lineage_source({"lineage_slow_query_log_seconds": 0.001})
+
+        long_sql = "SELECT " + "x" * 600 + " FROM DBC.QryLogV"
+        with (
+            _patch_lineage_fetch(
+                source, rows=[], query_sql=long_sql, fake_db_elapsed=0.1
+            ),
+            caplog.at_level(
+                logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        slow_warnings = [
+            r
+            for r in caplog.records
+            if "Slow lineage query" in r.message
+            and r.name == "datahub.ingestion.source.sql.teradata"
+        ]
+        assert len(slow_warnings) == 1
+        assert "…" in slow_warnings[0].message
+
+    def test_disabled_threshold_never_warns(self, caplog):
+        """Setting lineage_slow_query_log_seconds=0 disables slow-query logging."""
+        source = _make_lineage_source({"lineage_slow_query_log_seconds": 0.0})
+
+        with (
+            _patch_lineage_fetch(source, rows=[], fake_db_elapsed=0.1),
+            caplog.at_level(
+                logging.WARNING, logger="datahub.ingestion.source.sql.teradata"
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        slow_warnings = [r for r in caplog.records if "Slow lineage query" in r.message]
+        assert len(slow_warnings) == 0
+        assert source.report.lineage_slow_queries_detected == 0
+
+    def test_timing_recorded_on_execute_failure(self):
+        """record_lineage_query_timing fires in the finally block even when
+        _execute_with_cursor_fallback raises — a deliberate contract that
+        prevents a refactor from silently moving the call inside the try block
+        (which would drop timing for failed queries entirely)."""
+        source = _make_lineage_source()
+        mock_conn = _make_mock_conn()
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(
+                source,
+                "_execute_with_cursor_fallback",
+                side_effect=DatabaseError("simulated DB failure", None, None),
+            ),
+            patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[LineageQuery(sql="SELECT 1", label="current_only")],
+            ),
+            pytest.raises(DatabaseError),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        # The timing entry must exist regardless of query failure.
+        assert "query_1 (current_only)" in source.report.lineage_query_timings
+
+
+class TestLineageWatchdog:
+    """The lineage-fetch watchdog emits a stall warning at most once per stall,
+    even when its loop body executes multiple times while the query is stuck."""
+
+    def test_watchdog_stall_warning_fires_exactly_once_per_stall(self) -> None:
+        """The stall_warned flag inside _watchdog prevents repeat firings.
+
+        When the watchdog ticks three times while the query is still blocked,
+        report.warning() must be called exactly once — not once per tick.
+        The test controls the watchdog loop by replacing the Event used for
+        watchdog_stop with a fast-cycling stub, so no real wall-clock time is
+        consumed for the check_interval sleep."""
+        source = _make_lineage_source({"lineage_fetch_stall_warning_seconds": 1})
+        mock_conn = _make_mock_conn()
+        result_mock = MagicMock()
+        result_mock.fetchmany.side_effect = [[], []]
+
+        # Two threading.Event instances we control directly (real events,
+        # not patched), used only for synchronisation between the test
+        # threads — not the watchdog_stop event.
+        main_is_blocked = Event()
+        main_can_continue = Event()
+
+        def _blocking_execute(conn, sql, **kwargs):
+            main_is_blocked.set()  # signal: main thread is inside the execute
+            main_can_continue.wait(timeout=15)
+            return result_mock
+
+        class _ThreeTickEvent:
+            """Replaces watchdog_stop inside _fetch_lineage_entries_chunked.
+
+            wait() returns False ("not stopped") three times so the watchdog
+            body runs three times, then returns True ("stopped") and releases
+            the main thread.  The minimum real check_interval is 10 s, so
+            without this stub the test would take 30 s+."""
+
+            def __init__(self) -> None:
+                self._tick = 0
+
+            def wait(self, timeout: Optional[float] = None) -> bool:
+                # Block until main thread is actually inside the execute so
+                # phase_state["last_event_at"] is already set.
+                main_is_blocked.wait(timeout=15)
+                self._tick += 1
+                if self._tick > 3:
+                    main_can_continue.set()  # release the blocked execute
+                    return True  # stop watchdog loop
+                return False  # run watchdog body again
+
+            def set(self) -> None:
+                pass  # called from the finally-block; safe to ignore
+
+        # Use thread-identity routing instead of a position-counted sequence.
+        # The watchdog thread is always named "teradata-lineage-watchdog" (see
+        # Thread(..., name=…) in _fetch_lineage_entries_chunked).  Returning
+        # a high value (100.0) from that thread and 0.0 from all others means
+        # elapsed = 100.0 − 0.0 = 100.0 >> stall_seconds (1) no matter how
+        # many logging or setup calls consume time.time() on the main thread.
+        def _thread_aware_time() -> float:
+            if current_thread().name == "teradata-lineage-watchdog":
+                return 100.0
+            return 0.0
+
+        with (
+            patch.object(source, "get_metadata_engine", return_value=MagicMock()),
+            patch.object(
+                source, "_retry_connect", side_effect=_mock_retry_connect(mock_conn)
+            ),
+            patch.object(
+                source,
+                "_execute_with_cursor_fallback",
+                side_effect=_blocking_execute,
+            ),
+            patch.object(
+                source,
+                "_make_lineage_queries",
+                return_value=[LineageQuery(sql="SELECT 1", label="current_only")],
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.Event",
+                return_value=_ThreeTickEvent(),
+            ),
+            patch(
+                "datahub.ingestion.source.sql.teradata.time.time",
+                side_effect=_thread_aware_time,
+            ),
+        ):
+            list(source._fetch_lineage_entries_chunked())
+
+        stall_warnings = [
+            w
+            for w in source.report.warnings
+            if w.title == "Lineage fetch stall detected"
+        ]
+        assert len(stall_warnings) == 1, (
+            f"Expected exactly 1 stall warning; got {len(stall_warnings)}"
+        )
+
+
+class TestHungViewAbandonPath:
+    """The fut.cancel() abandon path keeps num_view_processing_timeouts and
+    view_timeout_errors consistent so operators cannot see one counter change
+    without the other."""
+
+    def test_hung_view_increments_timeout_counters_consistently(self):
+        """When a view worker exceeds view_processing_timeout_seconds the
+        connector abandons it: num_view_processing_timeouts,
+        view_timeout_errors, and num_view_processing_failures must all be
+        incremented exactly once so the counters tell a consistent story.
+
+        Uses event-based synchronization and mocked time/wait so the test
+        never blocks on real wall-clock sleeps and is safe on loaded CI."""
+        block = Event()
+        worker_started = Event()
+
+        def _blocking_process_view(**kwargs):
+            worker_started.set()
+            block.wait(timeout=10)
+            return iter([])
+
+        source = _create_source_patched(
+            {
+                "max_workers": 2,
+                "view_processing_timeout_seconds": 1,
+                "view_processing_heartbeat_seconds": 1,
+            }
+        )
+        mock_conn = _make_mock_conn()
+        mock_inspector = _make_mock_inspector("testdb")
+        mock_engine = MagicMock()
+
+        # Thread-aware time mock: the control thread sees 0.0 for the first
+        # two calls (submit timestamp + last_heartbeat_at initialisation) and
+        # 100.0 for all subsequent calls (stall-check now), so
+        # now − started = 100.0 >> 1 s timeout.
+        # Worker threads (teradata-view-*) always return 0.0 so their
+        # internal timing arithmetic stays non-negative.
+        _control_calls = 0
+
+        def _fake_time() -> float:
+            nonlocal _control_calls
+            if current_thread().name == "test-hung-view-control":
+                _control_calls += 1
+                return 0.0 if _control_calls <= 2 else 100.0
+            return 0.0
+
+        # Fake wait: block until the worker is provably stalled, then return
+        # an empty done-set immediately.  This avoids both the real 1-second
+        # heartbeat-interval sleep and the need for any wall-clock buffer.
+        def _fake_wait(fs, timeout=None, return_when=None):
+            worker_started.wait(timeout=5.0)
+            return (set(), set())
+
+        def _run() -> None:
+            with (
+                patch.object(
+                    source, "_get_or_create_pooled_engine", return_value=mock_engine
+                ),
+                patch.object(
+                    source,
+                    "_retry_connect",
+                    side_effect=_mock_retry_connect(mock_conn),
+                ),
+                patch.object(source, "_retry_execute"),
+                patch(
+                    "datahub.ingestion.source.sql.teradata.inspect",
+                    return_value=mock_inspector,
+                ),
+                patch.object(
+                    source, "_process_view", side_effect=_blocking_process_view
+                ),
+                patch(
+                    "datahub.ingestion.source.sql.teradata.time.time",
+                    side_effect=_fake_time,
+                ),
+                patch(
+                    "datahub.ingestion.source.sql.teradata.wait",
+                    side_effect=_fake_wait,
+                ),
+            ):
+                list(
+                    source._loop_views_with_connection_pool(
+                        ["stuck_view"], "testdb", source.config
+                    )
+                )
+
+        t = Thread(target=_run, daemon=True, name="test-hung-view-control")
+        t.start()
+        t.join(timeout=5.0)
+        # Release the worker thread so it can exit cleanly (executor.shutdown
+        # is wait=False, so _run finishes without blocking on the worker).
+        block.set()
+        assert not t.is_alive(), "view-processing thread did not terminate"
+
+        assert source.report.num_view_processing_timeouts == 1
+        assert source.report.view_timeout_errors == 1
+        assert source.report.num_view_processing_failures == 1
+        assert any(
+            any("stuck_view" in ctx for ctx in w.context)
+            for w in source.report.warnings
+        )
+
+
 class TestCharPaddingFixes:
     """Teradata returns CHAR(N) values space-padded over the wire. The library's
     strict comparisons (`row['Nullable'] == 'Y'`, `row['IdColType'] in ('GA',
@@ -4205,3 +5329,420 @@ class TestCharPaddingFixes:
             library_col_info={"name": "col1", "nullable": True, "autoincrement": False},
         )
         assert cols[0]["autoincrement"] is False
+
+
+class TestProfilingTimeout:
+    """Per-table profiling timeout: a single slow table must not block all others."""
+
+    # ------------------------------------------------------------------
+    # Config defaults
+    # ------------------------------------------------------------------
+
+    def test_default_profiling_timeout_seconds(self):
+        config = TeradataConfig.model_validate(_base_config())
+        assert config.profiling_timeout_seconds == 300
+
+    def test_custom_profiling_timeout_accepted(self):
+        config = TeradataConfig.model_validate(
+            {**_base_config(), "profiling_timeout_seconds": 600}
+        )
+        assert config.profiling_timeout_seconds == 600
+
+    def test_profiling_timeout_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            TeradataConfig.model_validate(
+                {**_base_config(), "profiling_timeout_seconds": 0}
+            )
+
+    # ------------------------------------------------------------------
+    # loop_profiler timeout enforcement
+    # ------------------------------------------------------------------
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def _make_profile_result(self, name: str) -> MagicMock:
+        """A minimal DatasetProfile-like object."""
+        profile = MagicMock()
+        profile.sizeInBytes = None
+        profile.timestampMillis = 0
+        return profile
+
+    def test_timeout_increments_counter_and_emits_warning(self):
+        """A table whose profiling exceeds the timeout is skipped; the counter
+        and warning report are updated exactly once."""
+        block = Event()
+
+        def _blocking_generate_profiles(requests, max_workers, **kwargs):
+            block.wait(timeout=10)
+            for req in requests:
+                yield req, self._make_profile_result(req.pretty_name)
+
+        source = _create_source_patched({"profiling_timeout_seconds": 1})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _blocking_generate_profiles
+
+        request = self._make_profiler_request("db.huge_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            list(source.loop_profiler([request], mock_profiler))
+
+        block.set()
+
+        assert source.report.num_profiling_timeouts == 1
+        assert any(
+            "huge_table" in ctx
+            for w in source.report.warnings
+            for ctx in (w.context if isinstance(w.context, list) else [w.context or ""])
+        )
+
+    def test_successful_table_yields_work_unit(self):
+        """A table that completes within the timeout produces a MetadataWorkUnit."""
+        profile_obj = self._make_profile_result("db.fast_table")
+
+        def _immediate_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                yield req, profile_obj
+
+        source = _create_source_patched({"profiling_timeout_seconds": 30})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _immediate_generate_profiles
+
+        request = self._make_profiler_request("db.fast_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_timeouts == 0
+        assert len(work_units) == 1
+        assert isinstance(work_units[0], MetadataWorkUnit)
+
+    def test_slow_table_does_not_block_fast_tables(self):
+        """When one table times out, other tables still produce work units."""
+        slow_event = Event()
+        results_order: List[str] = []
+
+        def _mixed_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                if req.pretty_name == "db.slow_table":
+                    slow_event.wait(timeout=10)
+                results_order.append(req.pretty_name)
+                yield req, self._make_profile_result(req.pretty_name)
+
+        source = _create_source_patched({"profiling_timeout_seconds": 1})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _mixed_generate_profiles
+
+        requests = [
+            self._make_profiler_request("db.fast_table_1"),
+            self._make_profiler_request("db.slow_table"),
+            self._make_profiler_request("db.fast_table_2"),
+        ]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        slow_event.set()
+
+        assert source.report.num_profiling_timeouts == 1
+        # The two fast tables must still produce work units despite the timeout.
+        assert len(work_units) == 2
+
+    def test_none_profile_is_skipped_without_timeout_penalty(self):
+        """A None profile (e.g. profiler setup failed) is silently skipped and
+        does not increment num_profiling_timeouts."""
+
+        def _none_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                yield req, None
+
+        source = _create_source_patched({"profiling_timeout_seconds": 30})
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _none_generate_profiles
+
+        request = self._make_profiler_request("db.empty_table")
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_timeouts == 0
+        assert len(work_units) == 0
+
+
+class TestProfilingReservedConnections:
+    """profiling_reserved_connections caps profiling concurrency to avoid
+    starving view-processing threads of their DB connections."""
+
+    # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
+
+    def test_custom_value_accepted_when_below_max_pool_size(self):
+        config = TeradataConfig.model_validate(
+            {**_base_config(), "profiling_reserved_connections": 6, "max_pool_size": 13}
+        )
+        assert config.profiling_reserved_connections == 6
+
+    def test_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            TeradataConfig.model_validate(
+                {**_base_config(), "profiling_reserved_connections": 0}
+            )
+
+    def test_rejects_value_equal_to_max_pool_size(self):
+        """Equal to max_pool_size leaves zero connections for view processing."""
+        with pytest.raises(ValidationError, match="max_pool_size"):
+            TeradataConfig.model_validate(
+                {
+                    **_base_config(),
+                    "profiling_reserved_connections": 13,
+                    "max_pool_size": 13,
+                }
+            )
+
+    def test_rejects_value_greater_than_max_pool_size(self):
+        with pytest.raises(ValidationError, match="max_pool_size"):
+            TeradataConfig.model_validate(
+                {
+                    **_base_config(),
+                    "profiling_reserved_connections": 20,
+                    "max_pool_size": 13,
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # loop_profiler concurrency capping
+    # ------------------------------------------------------------------
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def test_loop_profiler_concurrency_capped_at_reserved_connections(self):
+        """loop_profiler must not launch more than profiling_reserved_connections
+        concurrent workers, even when profiling.max_workers is much larger."""
+        observed_workers: List[int] = []
+        active_lock = __import__("threading").Lock()
+        active_count = [0]
+
+        def _tracking_generate_profiles(requests, max_workers, **kwargs):
+            with active_lock:
+                active_count[0] += 1
+                observed_workers.append(active_count[0])
+            try:
+                for req in requests:
+                    profile = MagicMock()
+                    profile.sizeInBytes = None
+                    yield req, profile
+            finally:
+                with active_lock:
+                    active_count[0] -= 1
+
+        source = _create_source_patched(
+            {
+                "profiling_reserved_connections": 2,
+                "max_pool_size": 13,
+            }
+        )
+        # Force profiling.max_workers above the reserved limit so the cap is exercised.
+        source.config.profiling.max_workers = 10
+
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _tracking_generate_profiles
+
+        requests = [self._make_profiler_request(f"db.table_{i}") for i in range(6)]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert len(work_units) == 6
+        assert max(observed_workers) <= 2, (
+            f"Expected at most 2 concurrent profiling workers "
+            f"but saw peak of {max(observed_workers)}"
+        )
+
+    def test_loop_profiler_uses_max_workers_when_below_reserved_connections(self):
+        """When profiling.max_workers < profiling_reserved_connections, the lower
+        value governs; no unnecessary capping log is emitted."""
+        call_count = [0]
+
+        def _counting_generate_profiles(requests, max_workers, **kwargs):
+            call_count[0] += 1
+            for req in requests:
+                profile = MagicMock()
+                profile.sizeInBytes = None
+                yield req, profile
+
+        source = _create_source_patched(
+            {
+                "profiling_reserved_connections": 8,
+                "max_pool_size": 13,
+            }
+        )
+        # profiling.max_workers (3) < profiling_reserved_connections (8): no cap applied.
+        source.config.profiling.max_workers = 3
+
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _counting_generate_profiles
+
+        requests = [self._make_profiler_request(f"db.table_{i}") for i in range(3)]
+
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert len(work_units) == 3
+
+
+class TestProfilingPermissionErrors:
+    """Permission errors during profiling must be caught per-table so that one
+    table's missing privilege does not abort profiling for the rest."""
+
+    def _make_profiler_request(self, name: str) -> MagicMock:
+        req = MagicMock()
+        req.pretty_name = name
+        req.batch_kwargs = {"schema": "db", "table": name, "partition": None}
+        return req
+
+    def _make_profile_result(self) -> MagicMock:
+        profile = MagicMock()
+        profile.sizeInBytes = None
+        return profile
+
+    # ------------------------------------------------------------------
+    # Teradata error-code variants (3523, 3524)
+    # ------------------------------------------------------------------
+
+    def test_permission_error_3523_increments_counter_and_emits_warning(self):
+        """Error 3523 (table-level access denied) is caught; counter and
+        warning are updated and the loop continues."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError(
+                "[Error 3523] User 'etl_user' does not have SELECT access to db.secret_table.",
+                {},
+                None,
+            )
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("db.secret_table")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 0
+        assert any(
+            "secret_table" in ctx
+            for w in source.report.warnings
+            for ctx in (w.context if isinstance(w.context, list) else [w.context or ""])
+        )
+
+    def test_permission_error_3524_increments_counter_and_emits_warning(self):
+        """Error 3524 (database-level access denied) is handled identically."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError(
+                "[Error 3524] User 'etl_user' does not have SELECT access to database restricted_db.",
+                {},
+                None,
+            )
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("restricted_db.table_a")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 0
+
+    # ------------------------------------------------------------------
+    # Keyword-based detection (no numeric code in message)
+    # ------------------------------------------------------------------
+
+    def test_permission_denied_keyword_is_caught(self):
+        """Messages containing 'permission denied' without a numeric code are
+        still classified as permission errors."""
+
+        def _denied_generate_profiles(requests, max_workers, **kwargs):
+            raise OperationalError("permission denied for table db.t", {}, None)
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _denied_generate_profiles
+
+        request = self._make_profiler_request("db.t")
+        with patch.object(source, "get_profile_args", return_value={}):
+            list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+
+    # ------------------------------------------------------------------
+    # Non-permission errors are not miscounted
+    # ------------------------------------------------------------------
+
+    def test_non_permission_error_does_not_increment_permission_counter(self):
+        """A generic failure (e.g. network error) must not be counted as a
+        permission error — the counter must stay at 0."""
+
+        def _failing_generate_profiles(requests, max_workers, **kwargs):
+            raise RuntimeError("unexpected failure")
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _failing_generate_profiles
+
+        request = self._make_profiler_request("db.flaky_table")
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler([request], mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 0
+        assert len(work_units) == 0
+
+    # ------------------------------------------------------------------
+    # Isolation — permission error on one table must not block others
+    # ------------------------------------------------------------------
+
+    def test_permission_error_does_not_block_other_tables(self):
+        """When one table raises a permission error, the remaining tables in
+        the batch still complete and yield work units."""
+
+        def _selective_generate_profiles(requests, max_workers, **kwargs):
+            for req in requests:
+                if "secret" in req.pretty_name:
+                    raise OperationalError(
+                        "[Error 3523] no SELECT access to db.secret_table.", {}, None
+                    )
+                yield req, self._make_profile_result()
+
+        source = _create_source_patched()
+        mock_profiler = MagicMock()
+        mock_profiler.generate_profiles.side_effect = _selective_generate_profiles
+
+        requests = [
+            self._make_profiler_request("db.public_table_1"),
+            self._make_profiler_request("db.secret_table"),
+            self._make_profiler_request("db.public_table_2"),
+        ]
+        with patch.object(source, "get_profile_args", return_value={}):
+            work_units = list(source.loop_profiler(requests, mock_profiler))
+
+        assert source.report.num_profiling_permission_errors == 1
+        assert len(work_units) == 2
+
+    # ------------------------------------------------------------------
+    # Counter starts at zero
+    # ------------------------------------------------------------------
+
+    def test_counter_starts_at_zero(self):
+        source = _create_source_patched()
+        assert source.report.num_profiling_permission_errors == 0
