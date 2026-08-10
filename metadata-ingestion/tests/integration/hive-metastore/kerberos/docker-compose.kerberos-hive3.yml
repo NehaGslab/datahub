@@ -1,0 +1,148 @@
+# Hive 3.x Kerberos environment for reproducing QOP mismatch errors
+# 
+# Usage:
+#   docker compose -f docker-compose.kerberos-hive3.yml up -d
+#
+# This setup uses Hive 3.x which STRICTLY enforces QOP settings.
+# Unlike Hive 2.x, connecting with a mismatched QOP will fail with:
+#   "Invalid token was supplied" / "Token header is malformed or corrupt"
+#
+# The server is configured with: hive.metastore.thrift.sasl.qop=auth-conf
+# Clients MUST use qop=auth-conf or the connection will fail after SASL handshake.
+
+services:
+  # MIT Kerberos KDC with Hive 3.x principals
+  kdc:
+    build:
+      context: .
+      dockerfile: Dockerfile.kdc
+    hostname: kdc.test.local
+    container_name: kdc-hive3
+    environment:
+      KRB5_REALM: TEST.LOCAL
+      KRB5_KDC: kdc.test.local
+      KRB5_PASS: admin
+    volumes:
+      - krb5-keytabs-hive3:/keytabs
+      # Override the init script with Hive 3.x principals
+      - ./init-keytabs-hive3.sh:/init-keytabs.sh:ro
+    ports:
+      - "89:88/udp"
+      - "89:88/tcp"
+      - "750:749"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/keytabs/hive.keytab"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    networks:
+      - hive3-kerberos
+
+  # PostgreSQL for Hive 3.x Metastore
+  hive3-metastore-postgresql:
+    image: postgres:13
+    container_name: hive3-metastore-postgresql
+    hostname: hive3-metastore-postgresql
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+    ports:
+      - "5434:5432"
+    volumes:
+      - hive3-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - hive3-kerberos
+
+  # Hive 3.x Metastore with Kerberos and STRICT QOP
+  hive3-metastore:
+    build:
+      context: .
+      dockerfile: Dockerfile.hive3
+    container_name: hive3-metastore
+    hostname: hive3-metastore.test.local
+    environment:
+      # Kerberos environment
+      KRB5_CONFIG: /etc/krb5.conf
+      # Override the Hadoop user (short name, not full principal)
+      HADOOP_USER_NAME: hive
+      # Java Kerberos settings - force keytab login
+      HADOOP_OPTS: >-
+        -Dsun.security.krb5.debug=true
+        -Djavax.security.auth.useSubjectCredsOnly=false
+        -Djava.security.auth.login.config=/dev/null
+    volumes:
+      - krb5-keytabs-hive3:/keytabs
+      - ./krb5.conf:/etc/krb5.conf:ro
+      - ./core-site-hive3.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+    ports:
+      - "9084:9083"
+    depends_on:
+      kdc:
+        condition: service_healthy
+      hive3-metastore-postgresql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9083 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    networks:
+      - hive3-kerberos
+
+  # Test client for Hive 3.x
+  kerberos-client-hive3:
+    image: ubuntu:22.04
+    container_name: kerberos-client-hive3
+    hostname: client.test.local
+    volumes:
+      - krb5-keytabs-hive3:/keytabs:ro
+      - ./krb5.conf:/tmp/krb5.conf:ro
+      - ./test_qop_mismatch.py:/test_qop_mismatch.py:ro
+    depends_on:
+      - kdc
+      - hive3-metastore
+    command: >
+      bash -c "
+        set -e &&
+        export DEBIAN_FRONTEND=noninteractive &&
+        echo 'Installing packages...' &&
+        apt-get update &&
+        echo 'krb5-config krb5-config/default_realm string TEST.LOCAL' | debconf-set-selections &&
+        echo 'krb5-config krb5-config/kerberos_servers string kdc.test.local' | debconf-set-selections &&
+        echo 'krb5-config krb5-config/admin_server string kdc.test.local' | debconf-set-selections &&
+        apt-get install -y --no-install-recommends krb5-user libkrb5-dev python3 python3-pip python3-dev gcc netcat-openbsd &&
+        cp /tmp/krb5.conf /etc/krb5.conf &&
+        echo 'Installing Python packages...' &&
+        pip3 install 'acryl-pyhive[hive-pure-sasl]' 'pymetastore>=0.4.2' kerberos &&
+        echo 'Waiting for HMS to be ready...' &&
+        sleep 60 &&
+        echo 'Authenticating with Kerberos...' &&
+        kinit -kt /keytabs/testuser.keytab testuser@TEST.LOCAL &&
+        klist &&
+        echo 'Client ready!' &&
+        tail -f /dev/null
+      "
+    environment:
+      KRB5_CONFIG: /etc/krb5.conf
+      DEBIAN_FRONTEND: noninteractive
+      # Override HMS host for test script
+      HMS_HOST: hive3-metastore
+    networks:
+      - hive3-kerberos
+
+networks:
+  hive3-kerberos:
+    driver: bridge
+
+volumes:
+  krb5-keytabs-hive3:
+  hive3-postgres-data:
+

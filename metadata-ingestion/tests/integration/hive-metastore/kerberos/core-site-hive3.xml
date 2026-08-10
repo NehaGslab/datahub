@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Hadoop core-site.xml for Hive 3.x Kerberos authentication with STRICT QOP
+-->
+<configuration>
+    <!-- Enable Kerberos authentication for Hadoop -->
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>kerberos</value>
+    </property>
+    <property>
+        <name>hadoop.security.authorization</name>
+        <value>true</value>
+    </property>
+    
+    <!-- STRICT QOP: Force privacy (encryption) for all RPC -->
+    <property>
+        <name>hadoop.rpc.protection</name>
+        <value>privacy</value>
+        <description>
+            Force encrypted RPC. Options: authentication, integrity, privacy.
+            'privacy' = auth-conf (encryption required)
+        </description>
+    </property>
+    
+    <!-- Kerberos principal and keytab for the Hive service -->
+    <property>
+        <name>hadoop.kerberos.keytab.login.autorenewal.enabled</name>
+        <value>true</value>
+    </property>
+</configuration>
+

@@ -46,6 +46,11 @@
         <!-- Use FQDN to match Python/MIT Kerberos canonicalization -->
         <value>hive/hive-metastore.test.local@TEST.LOCAL</value>
     </property>
+    <property>
+        <name>hive.metastore.thrift.sasl.qop</name>
+        <value>auth-conf</value>
+        <description>Require encrypted Thrift RPC</description>
+    </property>
 
     <!-- HiveServer2 Authentication - use NONE for easy test data loading -->
     <!-- In customer's environment, HiveServer2 is NOT available anyway. -->
